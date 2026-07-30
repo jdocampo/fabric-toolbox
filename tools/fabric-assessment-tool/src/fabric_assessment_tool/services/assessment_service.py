@@ -33,6 +33,10 @@ class AssessmentService:
         sql_client_id: Optional[str] = None,
         sql_client_secret: Optional[str] = None,
         sql_tenant_id: Optional[str] = None,
+        query_history_days: int = 7,
+        query_history_top: int = 1000,
+        include_sql_text: bool = False,
+        skip_query_history: bool = False,
     ) -> Dict[str, Any]:
         """
         Perform assessment on specified workspaces.
@@ -62,7 +66,7 @@ class AssessmentService:
         # print(f"Initializing {source} client...")
 
         # Get or create client for the source
-        client_kwargs = {}
+        client_kwargs: Dict[str, Any] = {}
         if subscription_id:
             client_kwargs["subscription_id"] = subscription_id
         if auth_method:
@@ -80,10 +84,14 @@ class AssessmentService:
             client_kwargs["sql_client_secret"] = sql_client_secret
         if sql_tenant_id:
             client_kwargs["sql_tenant_id"] = sql_tenant_id
+        client_kwargs["query_history_days"] = query_history_days
+        client_kwargs["query_history_top"] = query_history_top
+        client_kwargs["include_sql_text"] = include_sql_text
+        client_kwargs["skip_query_history"] = skip_query_history
         client = self._get_client(source=source, **client_kwargs)
 
         # Perform assessment
-        assessment_results = {
+        assessment_results: Dict[str, Any] = {
             "metadata": {
                 "source": source,
                 "mode": mode,
@@ -101,7 +109,7 @@ class AssessmentService:
             },
         }
 
-        export_results = {"results": []}
+        export_results: Dict[str, Any] = {"results": []}
 
         if not workspaces or len(workspaces) == 0:
             # Get all workspaces from the client and let the client choose which ones to assess
