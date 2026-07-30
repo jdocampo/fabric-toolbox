@@ -85,6 +85,33 @@ Examples:
             help="Auto-create vTableSizes DMV without confirmation prompt (for non-interactive execution)",
         )
 
+        parser.add_argument(
+            "--extract-definitions",
+            action="store_true",
+            default=False,
+            help="Extract stored procedure, function, and view definitions from dedicated SQL pools",
+        )
+
+        parser.add_argument(
+            "--definition-redaction",
+            choices=["none", "full", "partial", "hash"],
+            default="partial",
+            help="Definition protection mode (default: partial)",
+        )
+
+        parser.add_argument(
+            "--definition-schema-filter",
+            default="",
+            help="Comma-separated exact schema names to include in definition extraction",
+        )
+
+        parser.add_argument(
+            "--max-definition-size",
+            type=self._non_negative_int,
+            default=1_000_000,
+            help="Maximum stored definition characters; 0 disables the limit",
+        )
+
         # SQL authentication mode options for dedicated SQL pools
         parser.add_argument(
             "--sql-auth-mode",
@@ -141,6 +168,16 @@ Examples:
                 sql_client_id=getattr(args, "sql_client_id", None),
                 sql_client_secret=getattr(args, "sql_client_secret", None),
                 sql_tenant_id=getattr(args, "sql_tenant_id", None),
+                extract_definitions=getattr(args, "extract_definitions", False),
+                definition_redaction=getattr(args, "definition_redaction", "partial"),
+                definition_schema_filter=[
+                    schema.strip()
+                    for schema in getattr(args, "definition_schema_filter", "").split(
+                        ","
+                    )
+                    if schema.strip()
+                ],
+                max_definition_size=getattr(args, "max_definition_size", 1_000_000),
             )
 
             utils_ui.print(f"Assessment completed successfully!")
@@ -152,7 +189,9 @@ Examples:
                     workspace_name = export_result.get("workspace_name", "Unknown")
                     workspace_dir = export_result.get("workspace_directory", "")
                     total_files = export_result.get("total_files", 0)
-                    utils_ui.print(f"  {workspace_name}: {total_files} files in {workspace_dir}")
+                    utils_ui.print(
+                        f"  {workspace_name}: {total_files} files in {workspace_dir}"
+                    )
 
             # Show detailed status information for each workspace
             if result.get("results"):
@@ -160,12 +199,16 @@ Examples:
                 for workspace_result in result["results"]:
                     workspace_name = workspace_result.get("workspace", "Unknown")
                     status = workspace_result.get("status", "unknown")
-                    
+
                     if status == "success":
                         print(f"  ✓ {workspace_name}: Completed successfully")
                     elif status == "incomplete":
-                        assessment_status = workspace_result.get("assessment_status", {})
-                        description = assessment_status.get("description", "Assessment incomplete")
+                        assessment_status = workspace_result.get(
+                            "assessment_status", {}
+                        )
+                        description = assessment_status.get(
+                            "description", "Assessment incomplete"
+                        )
                         print(f"  ⚠ {workspace_name}: {description}")
                     elif status == "failed":
                         error = workspace_result.get("error", "Unknown error")
@@ -182,3 +225,10 @@ Examples:
         except Exception as e:
             print(f"Assessment failed: {e}")
             raise
+
+    @staticmethod
+    def _non_negative_int(value: str) -> int:
+        parsed = int(value)
+        if parsed < 0:
+            raise argparse.ArgumentTypeError("value must be non-negative")
+        return parsed

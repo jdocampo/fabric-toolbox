@@ -131,6 +131,13 @@ When using Entra ID authentication modes (`entra-interactive`, `entra-spn`, or `
    GRANT CREATE VIEW TO [user@yourdomain.com];
    ```
 
+4. **Definition Permission** (Optional): If you use `--extract-definitions`, grant access to stored procedure, function, and view text:
+   ```sql
+   GRANT VIEW DEFINITION TO [user@yourdomain.com];
+   ```
+
+   Without this permission, the assessment continues and records the affected definitions or database as unavailable.
+
 > **Note:** Ensure that the Azure Synapse workspace has Entra ID authentication enabled with an Entra ID admin configured. See [Microsoft documentation](https://learn.microsoft.com/en-us/azure/synapse-analytics/sql/active-directory-authentication) for details.
 
 
@@ -160,6 +167,14 @@ fat assess --source <synapse|databricks> \
 - `--auth-method`: Authentication method (`azure-cli` or `fabric`). Default: auto-detect based on environment
 - `--sql-admin-password`: SQL admin password for dedicated SQL pools (bypasses interactive prompt)
 - `--create-dmv`: Auto-create vTableSizes DMV without confirmation prompt (for non-interactive execution)
+- `--extract-definitions`: Opt in to stored procedure, function, and view definition extraction from Synapse dedicated SQL pools
+- `--definition-redaction`: Protect exported SQL using `none`, `full`, `partial` (default), or `hash`
+  - `none`: Store SQL text, subject to `--max-definition-size`
+  - `full`: Store metadata only
+  - `partial`: Store a bounded prefix and suffix with the middle removed
+  - `hash`: Store metadata and a SHA-256 digest, but no SQL text
+- `--definition-schema-filter`: Comma-separated exact schema names to include
+- `--max-definition-size`: Maximum stored definition characters (default: `1000000`; `0` disables the limit). Original length and truncation status are always retained
 - `--sql-auth-mode`: SQL pool authentication mode for dedicated SQL pools:
   - `sql` (default): Traditional SQL authentication with username/password
   - `entra-interactive`: Entra ID interactive authentication (browser popup with MFA support)
@@ -191,9 +206,29 @@ fat assess --source synapse --ws workspace1 -o ./results \
 # Assess with Entra ID default (uses Azure CLI credentials)
 fat assess --source synapse --ws workspace1 -o ./results --sql-auth-mode entra-default
 
+# Extract dedicated SQL definitions with safe defaults
+fat assess --source synapse --ws workspace1 -o ./results \
+    --sql-auth-mode entra-default \
+    --extract-definitions \
+    --definition-redaction partial \
+    --definition-schema-filter dbo,reporting \
+    --max-definition-size 1000000
+
 # Assess Databricks workspace
 fat assess --source databricks --ws my-workspace --output results_folder
 ```
+
+Definition extraction is Synapse dedicated-pool only and is disabled unless `--extract-definitions` is supplied. Definition JSON is written by object type under:
+
+```text
+data/dedicated_databases/databases/{database}/definitions/
+├── summary.json
+├── stored_procedures/{schema}.{object}.json
+├── functions/{schema}.{object}.json
+└── views/{schema}.{object}.json
+```
+
+Definitions are read from `sys.sql_modules` as unbounded SQL text, avoiding the 4,000-character limit of `INFORMATION_SCHEMA.ROUTINES.ROUTINE_DEFINITION`. Encrypted modules, missing `VIEW DEFINITION` access, original length, and truncation are recorded in metadata. The generated HTML report uses metadata only and never displays SQL text.
 
 ### `fat visualize` - Generate interactive HTML reports
 
@@ -246,7 +281,7 @@ fat visualize -i ./assessment_output --view data-engineering -o ./engineering_re
 **Synapse-Specific Views:**
 - **Admin**: Linked services, integration runtimes, managed private endpoints, Spark libraries, Spark configurations
 - **Data Engineering**: Notebooks (with language, Spark config, MSSparkUtils usage), Spark pools, Spark job definitions
-- **Data Warehousing**: Dedicated SQL pools (tables, size, stored procedures), serverless databases
+- **Data Warehousing**: Dedicated SQL pools, tables, serverless databases, and optional SQL definition type/size/age analysis
 - **Data Integration**: Pipelines (activity counts, complexity), dataflows, datasets
 
 **Databricks-Specific Views:**

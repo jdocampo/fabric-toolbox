@@ -15,6 +15,7 @@ from ..assessment.synapse import (
     SynapseDataflows,
     SynapseDataset,
     SynapseDatasets,
+    SynapseDefinitionSummary,
     SynapseDedicatedDatabase,
     SynapseDedicatedPool,
     SynapseDedicatedPools,
@@ -42,6 +43,7 @@ from ..assessment.synapse import (
     SynapseSparkPool,
     SynapseSparkPools,
     SynapseSqlPools,
+    SynapseSqlDefinitions,
     SynapseSqlScript,
     SynapseSqlScripts,
     SynapseTable,
@@ -53,8 +55,12 @@ from ..assessment.synapse import (
 )
 from ..utils import ui as utils_ui
 from .api_client import ApiClient
-from .odbc_client import OdbcClient
-from .token_provider import FabricNotebookTokenProvider, TokenProvider, create_token_provider
+from .odbc_client import DefinitionRedactionMode, OdbcClient, SqlAuthMode
+from .token_provider import (
+    FabricNotebookTokenProvider,
+    TokenProvider,
+    create_token_provider,
+)
 
 
 class SynapseClient:
@@ -67,10 +73,14 @@ class SynapseClient:
         auth_method: Optional[str] = None,
         sql_admin_password: Optional[str] = None,
         create_dmv: bool = False,
-        sql_auth_mode: str = "sql",
+        sql_auth_mode: SqlAuthMode = "sql",
         sql_client_id: Optional[str] = None,
         sql_client_secret: Optional[str] = None,
         sql_tenant_id: Optional[str] = None,
+        extract_definitions: bool = False,
+        definition_redaction: DefinitionRedactionMode = "partial",
+        definition_schema_filter: Optional[list[str]] = None,
+        max_definition_size: int = 1_000_000,
         **kwargs,
     ):
         """
@@ -90,6 +100,10 @@ class SynapseClient:
             sql_client_id: Service principal client ID (required for 'entra-spn' mode)
             sql_client_secret: Service principal client secret (required for 'entra-spn' mode)
             sql_tenant_id: Azure tenant ID (optional for 'entra-spn' mode)
+            extract_definitions: Extract SQL module definitions from dedicated pools
+            definition_redaction: Definition protection mode
+            definition_schema_filter: Exact schema names to include
+            max_definition_size: Maximum stored definition characters; 0 is unlimited
         """
         self.token_provider = token_provider or create_token_provider(auth_method)
         self.custom_subscription_id = subscription_id
@@ -99,11 +113,16 @@ class SynapseClient:
         self.sql_client_id = sql_client_id
         self.sql_client_secret = sql_client_secret
         self.sql_tenant_id = sql_tenant_id
+        self.extract_definitions = extract_definitions
+        self.definition_redaction = definition_redaction
+        self.definition_schema_filter = definition_schema_filter or []
+        self.max_definition_size = max_definition_size
         self.authenticate()
         self._workspace_cache: dict[str, SynapseWorkspaceInfo] = {}
         self.dev_endpoint_permission_issues = False
-        self.unreached_components = []
-        self.paused_databases = []
+        self.unreached_components: list[str] = []
+        self.paused_databases: list[str] = []
+        self.definition_extraction_issues: list[str] = []
 
     def authenticate(self) -> None:
         """Authenticate with Azure using the configured token provider."""
@@ -201,6 +220,7 @@ class SynapseClient:
             self.dev_endpoint_permission_issues = False
             self.unreached_components = []
             self.paused_databases = []
+            self.definition_extraction_issues = []
 
             # Get workspace details
             workspace_info = self._get_workspace_info(workspace_name)
@@ -301,13 +321,17 @@ class SynapseClient:
                 for pool in sql_pools.dedicated_pools:
                     # Get dedicated databases table statistics - odbc client
                     db = pool.database
-                    table_statistics, code_object_count, code_object_lines = (
-                        self._get_dedicated_database_statistics(
-                            workspace_name,
-                            db.name,
-                            sql_admin_login,
-                            sql_admin_password,
-                        )
+                    (
+                        table_statistics,
+                        code_object_count,
+                        code_object_lines,
+                        definitions,
+                        definition_summary,
+                    ) = self._get_dedicated_database_statistics(
+                        workspace_name,
+                        db.name,
+                        sql_admin_login,
+                        sql_admin_password,
                     )
 
                     for schema in db.schemas.schemas:
@@ -328,12 +352,26 @@ class SynapseClient:
 
                     pool.code_lines = code_object_lines
                     pool.code_objects = code_object_count
+                    db.definitions = definitions
+                    db.definition_summary = definition_summary
                 utils_ui.print_extraction_done("Table Statistics")
 
             else:
                 utils_ui.print_warning(
                     "Skipping dedicated SQL databases table statistics collection."
                 )
+                if self.extract_definitions:
+                    for pool in sql_pools.dedicated_pools:
+                        pool.database.definition_summary = SynapseDefinitionSummary(
+                            extraction_status="unavailable",
+                            status_description=(
+                                "Definition extraction requires dedicated SQL pool "
+                                "authentication."
+                            ),
+                        )
+                    self.definition_extraction_issues.append(
+                        "dedicated SQL authentication was not available"
+                    )
 
             # Create assessment metadata
             assessment_metadata = SynapseAssessmentMetadata(
@@ -353,6 +391,13 @@ class SynapseClient:
             if len(self.paused_databases) > 0:
                 incomplete_reasons.append(
                     f"paused dedicated SQL databases: [{', '.join(self.paused_databases)}]"
+                )
+
+            if self.definition_extraction_issues:
+                incomplete_reasons.append(
+                    "definition extraction issues: ["
+                    + "; ".join(self.definition_extraction_issues)
+                    + "]"
                 )
 
             if incomplete_reasons:
@@ -1171,8 +1216,11 @@ class SynapseClient:
 
         # Fall back to ODBC
         return self._get_dedicated_schema_tables_odbc(
-            workspace_name, database_name, schema_name,
-            sql_admin_login, sql_admin_password,
+            workspace_name,
+            database_name,
+            schema_name,
+            sql_admin_login,
+            sql_admin_password,
         )
 
     def _get_dedicated_schema_tables_arm(
@@ -1251,8 +1299,18 @@ class SynapseClient:
             raise e
 
     def _get_dedicated_database_statistics(
-        self, workspace_name: str, database_name: str, sql_user: str, sql_password: str
-    ) -> tuple[list[TableStatistics], list[CodeObjectCount], list[CodeObjectLines]]:
+        self,
+        workspace_name: str,
+        database_name: str,
+        sql_user: Optional[str],
+        sql_password: Optional[str],
+    ) -> tuple[
+        list[TableStatistics],
+        list[CodeObjectCount],
+        list[CodeObjectLines],
+        SynapseSqlDefinitions,
+        SynapseDefinitionSummary,
+    ]:
         """Get table statistics from a database."""
 
         odbc_client = self._create_odbc_client(
@@ -1262,15 +1320,23 @@ class SynapseClient:
             sql_admin_password=sql_password,
         )
 
-        if not odbc_client.check_table_statistics_dmv_exists():
+        table_statistics: list[TableStatistics] = []
+        collect_table_statistics = odbc_client.check_table_statistics_dmv_exists()
+        if not collect_table_statistics:
             if self.create_dmv:
                 # Auto-create DMV in non-interactive mode
                 utils_ui.print_extracting(
                     f"Creating table statistics DMV in database {database_name}"
                 )
                 odbc_client.create_table_statistics_dmv()
+                collect_table_statistics = True
                 utils_ui.print_extraction_done(
                     f"Creating table statistics DMV in database {database_name}"
+                )
+            elif self.extract_definitions:
+                utils_ui.print_warning(
+                    f"Skipping table statistics for database {database_name}; "
+                    "the vTableSizes DMV does not exist."
                 )
             else:
                 # Ask for permission to create the view
@@ -1283,6 +1349,7 @@ class SynapseClient:
                         f"Creating table statistics DMV in database {database_name}"
                     )
                     odbc_client.create_table_statistics_dmv()
+                    collect_table_statistics = True
                     utils_ui.print_extraction_done(
                         f"Creating table statistics DMV in database {database_name}"
                     )
@@ -1290,12 +1357,45 @@ class SynapseClient:
                     utils_ui.print_warning(
                         f"Skipping table statistics collection for database {database_name}"
                     )
-                    return ([], [], [])
+                    return (
+                        [],
+                        [],
+                        [],
+                        SynapseSqlDefinitions(),
+                        SynapseDefinitionSummary(),
+                    )
+
+        if collect_table_statistics:
+            table_statistics = list(odbc_client.get_table_statistics(database_name))
+
+        definitions = SynapseSqlDefinitions()
+        definition_summary = SynapseDefinitionSummary()
+        if self.extract_definitions:
+            try:
+                definitions, definition_summary = odbc_client.get_sql_definitions(
+                    redaction_mode=self.definition_redaction,
+                    schema_filter=self.definition_schema_filter,
+                    max_definition_size=self.max_definition_size,
+                )
+                if definition_summary.extraction_status in ("partial", "unavailable"):
+                    self.definition_extraction_issues.append(
+                        f"{database_name}: {definition_summary.status_description}"
+                    )
+            except Exception as exc:
+                definition_summary = SynapseDefinitionSummary(
+                    extraction_status="unavailable",
+                    status_description=f"Definition extraction failed: {exc}",
+                )
+                self.definition_extraction_issues.append(
+                    f"{database_name}: definition extraction failed"
+                )
 
         return (
-            list(odbc_client.get_table_statistics(database_name)),
+            table_statistics,
             list(odbc_client.get_object_count(database_name)),
             list(odbc_client.get_code_lines_statistics(database_name)),
+            definitions,
+            definition_summary,
         )
 
     def _has_sql_credentials(
@@ -1387,7 +1487,9 @@ class SynapseClient:
 
         elif selected_auth.startswith("SQL Authentication"):
             if not sql_admin_login:
-                utils_ui.print_warning("SQL admin login not available for this workspace.")
+                utils_ui.print_warning(
+                    "SQL admin login not available for this workspace."
+                )
                 return None
             sql_admin_password = utils_ui.prompt_password(
                 f"Enter SQL admin (login: {sql_admin_login}) password: "

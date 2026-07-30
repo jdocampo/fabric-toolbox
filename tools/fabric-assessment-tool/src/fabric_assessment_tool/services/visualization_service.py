@@ -137,7 +137,7 @@ class VisualizationService:
         self, input_dir: Path, workspace: Optional[str] = None
     ) -> Dict[str, Any]:
         """Load assessment data from JSON files in the input directory."""
-        data = {
+        data: Dict[str, Any] = {
             "workspaces": {},
             "platform": None,
             "generated_at": datetime.now().isoformat(),
@@ -172,7 +172,7 @@ class VisualizationService:
         except (json.JSONDecodeError, IOError):
             return None
 
-        ws_data = {
+        ws_data: Dict[str, Any] = {
             "name": workspace_dir.name,
             "summary": summary,
             "platform": self._detect_platform(summary),
@@ -206,7 +206,7 @@ class VisualizationService:
 
     def _load_resources(self, resources_dir: Path) -> Dict[str, List[Dict[str, Any]]]:
         """Load all resources from a resources directory."""
-        resources = {}
+        resources: Dict[str, List[Dict[str, Any]]] = {}
         for category_dir in resources_dir.iterdir():
             if category_dir.is_dir():
                 resources[category_dir.name] = []
@@ -221,7 +221,7 @@ class VisualizationService:
 
     def _load_data_catalog(self, data_dir: Path) -> Dict[str, Any]:
         """Load data catalog information (databases, schemas, tables)."""
-        catalog = {}
+        catalog: Dict[str, Any] = {}
         for subdir in data_dir.iterdir():
             if subdir.is_dir():
                 catalog[subdir.name] = self._load_nested_data(subdir)
@@ -232,7 +232,7 @@ class VisualizationService:
         if depth > 5:  # Prevent infinite recursion
             return {}
 
-        result = {}
+        result: Dict[str, Any] = {}
         for item in directory.iterdir():
             if item.is_file() and item.suffix == ".json":
                 try:
@@ -248,7 +248,7 @@ class VisualizationService:
         self, workspaces: Dict[str, Dict[str, Any]]
     ) -> Dict[str, Any]:
         """Calculate aggregate summary statistics across all workspaces."""
-        summary = {
+        summary: Dict[str, Any] = {
             "workspace_count": len(workspaces),
             "total_notebooks": 0,
             "total_pipelines": 0,
@@ -539,7 +539,7 @@ class VisualizationService:
         self, workspaces: Dict[str, Dict[str, Any]]
     ) -> Dict[str, Any]:
         """Aggregate admin-related data across workspaces."""
-        admin = {
+        admin: Dict[str, Any] = {
             "integration_runtimes": [],
             "linked_services": [],
             "managed_private_endpoints": [],
@@ -581,7 +581,7 @@ class VisualizationService:
         self, workspaces: Dict[str, Dict[str, Any]], platform: str = "synapse"
     ) -> Dict[str, Any]:
         """Aggregate data engineering resources across workspaces."""
-        de = {
+        de: Dict[str, Any] = {
             "notebooks": [],
             "spark_pools": [],
             "spark_job_definitions": [],
@@ -643,9 +643,11 @@ class VisualizationService:
                     cl_data = cl.get("cluster_data") or cl.get("data") or cl
                     cl_data["workspace"] = ws_name
                     de["clusters"].append(cl_data)
-                    version = cl_data.get("spark_version") or (
-                        cl_data.get("json_response") or {}
-                    ).get("spark_version") or "Unknown"
+                    version = (
+                        cl_data.get("spark_version")
+                        or (cl_data.get("json_response") or {}).get("spark_version")
+                        or "Unknown"
+                    )
                     de["spark_versions"][version] = (
                         de["spark_versions"].get(version, 0) + 1
                     )
@@ -704,7 +706,7 @@ class VisualizationService:
         self, workspaces: Dict[str, Dict[str, Any]], platform: str = "synapse"
     ) -> Dict[str, Any]:
         """Aggregate data warehousing resources across workspaces."""
-        dw = {
+        dw: Dict[str, Any] = {
             "dedicated_pools": [],
             "serverless_pools": [],
             "sql_warehouses": [],
@@ -712,6 +714,20 @@ class VisualizationService:
             "databases": [],
             "total_tables": 0,
             "total_size_gb": 0,
+            "definitions": {
+                "databases_requested": 0,
+                "databases_completed": 0,
+                "total_objects": 0,
+                "counts_by_type": {},
+                "encrypted_objects": 0,
+                "unavailable_objects": 0,
+                "truncated_objects": 0,
+                "total_definition_characters": 0,
+                "age_buckets": {},
+                "largest_objects": [],
+                "database_summaries": [],
+                "by_workspace": {},
+            },
         }
 
         for ws_name, ws_data in workspaces.items():
@@ -770,21 +786,43 @@ class VisualizationService:
                         databases_dict = db_type_data.get("databases", {})
                         for db_folder_name, db_folder_data in databases_dict.items():
                             if isinstance(db_folder_data, dict):
-                                # Find the database JSON file inside
-                                for key, value in db_folder_data.items():
-                                    if isinstance(value, dict):
-                                        # Extract the data from the JSON structure
-                                        db_info = value.get("data", value)
-                                        if isinstance(db_info, dict):
-                                            db_entry = {
-                                                "name": db_info.get(
-                                                    "name", db_folder_name
-                                                ),
-                                                "workspace": ws_name,
-                                                "db_type": db_type,
-                                            }
-                                            dw["databases"].append(db_entry)
-                                            break  # Only take one per folder
+                                db_wrapper = db_folder_data.get(db_folder_name)
+                                if not isinstance(db_wrapper, dict):
+                                    db_wrapper = next(
+                                        (
+                                            value
+                                            for value in db_folder_data.values()
+                                            if isinstance(value, dict)
+                                            and value.get("type")
+                                            in (
+                                                "dedicated_database",
+                                                "serverless_database",
+                                            )
+                                        ),
+                                        {},
+                                    )
+                                db_info = db_wrapper.get("data", db_wrapper)
+                                if isinstance(db_info, dict):
+                                    db_entry = {
+                                        "name": db_info.get("name", db_folder_name),
+                                        "workspace": ws_name,
+                                        "db_type": db_type,
+                                    }
+                                    dw["databases"].append(db_entry)
+
+                                if db_type == "dedicated_databases":
+                                    self._add_definition_data(
+                                        aggregate=dw["definitions"],
+                                        definitions_data=db_folder_data.get(
+                                            "definitions", {}
+                                        ),
+                                        workspace=ws_name,
+                                        database=(
+                                            db_info.get("name", db_folder_name)
+                                            if isinstance(db_info, dict)
+                                            else db_folder_name
+                                        ),
+                                    )
 
             elif platform == "databricks":
                 # SQL warehouses
@@ -793,13 +831,115 @@ class VisualizationService:
                     wh_data["workspace"] = ws_name
                     dw["sql_warehouses"].append(wh_data)
 
+        dw["definitions"]["largest_objects"] = sorted(
+            dw["definitions"]["largest_objects"],
+            key=lambda item: item.get("original_length", 0),
+            reverse=True,
+        )[:20]
         return dw
+
+    def _add_definition_data(
+        self,
+        aggregate: Dict[str, Any],
+        definitions_data: Dict[str, Any],
+        workspace: str,
+        database: str,
+    ) -> None:
+        """Add one exported database definition hierarchy to report metadata."""
+
+        if not isinstance(definitions_data, dict):
+            return
+
+        summary_wrapper = definitions_data.get("summary", {})
+        summary = (
+            summary_wrapper.get("data", summary_wrapper)
+            if isinstance(summary_wrapper, dict)
+            else {}
+        )
+        if not isinstance(summary, dict) or not summary:
+            return
+
+        status = summary.get("extraction_status", "unknown")
+        aggregate["databases_requested"] += int(status != "not_requested")
+        aggregate["databases_completed"] += int(status == "completed")
+        aggregate["total_objects"] += summary.get("total_objects", 0)
+        aggregate["encrypted_objects"] += summary.get("encrypted_objects", 0)
+        aggregate["unavailable_objects"] += summary.get("unavailable_objects", 0)
+        aggregate["truncated_objects"] += summary.get("truncated_objects", 0)
+        aggregate["total_definition_characters"] += summary.get(
+            "total_definition_characters", 0
+        )
+
+        for object_type, count in summary.get("counts_by_type", {}).items():
+            aggregate["counts_by_type"][object_type] = (
+                aggregate["counts_by_type"].get(object_type, 0) + count
+            )
+        for bucket, count in summary.get("age_buckets", {}).items():
+            aggregate["age_buckets"][bucket] = (
+                aggregate["age_buckets"].get(bucket, 0) + count
+            )
+
+        database_summary = dict(summary)
+        database_summary["workspace"] = workspace
+        database_summary["database"] = database
+        aggregate["database_summaries"].append(database_summary)
+
+        workspace_summary = aggregate["by_workspace"].setdefault(
+            workspace,
+            {
+                "total_objects": 0,
+                "encrypted_objects": 0,
+                "unavailable_objects": 0,
+                "truncated_objects": 0,
+                "counts_by_type": {},
+                "age_buckets": {},
+            },
+        )
+        workspace_summary["total_objects"] += summary.get("total_objects", 0)
+        workspace_summary["encrypted_objects"] += summary.get("encrypted_objects", 0)
+        workspace_summary["unavailable_objects"] += summary.get(
+            "unavailable_objects", 0
+        )
+        workspace_summary["truncated_objects"] += summary.get("truncated_objects", 0)
+        for object_type, count in summary.get("counts_by_type", {}).items():
+            workspace_summary["counts_by_type"][object_type] = (
+                workspace_summary["counts_by_type"].get(object_type, 0) + count
+            )
+        for bucket, count in summary.get("age_buckets", {}).items():
+            workspace_summary["age_buckets"][bucket] = (
+                workspace_summary["age_buckets"].get(bucket, 0) + count
+            )
+
+        for type_directory in ("stored_procedures", "functions", "views"):
+            objects = definitions_data.get(type_directory, {})
+            if not isinstance(objects, dict):
+                continue
+            for wrapper in objects.values():
+                if not isinstance(wrapper, dict):
+                    continue
+                definition = wrapper.get("data", wrapper)
+                if not isinstance(definition, dict):
+                    continue
+                aggregate["largest_objects"].append(
+                    {
+                        "workspace": workspace,
+                        "database": definition.get("database", database),
+                        "schema": definition.get("schema", "unknown"),
+                        "name": definition.get("name", "unknown"),
+                        "object_type": definition.get("object_type", "unknown"),
+                        "original_length": definition.get("original_length", 0),
+                        "is_encrypted": definition.get("is_encrypted", False),
+                        "is_unavailable": definition.get("is_unavailable", False),
+                        "is_truncated": definition.get("is_truncated", False),
+                        "modified_at": definition.get("modified_at"),
+                    }
+                )
 
     def _aggregate_data_integration(
         self, workspaces: Dict[str, Dict[str, Any]]
     ) -> Dict[str, Any]:
         """Aggregate data integration resources across workspaces."""
-        di = {
+        di: Dict[str, Any] = {
             "pipelines": [],
             "dataflows": [],
             "datasets": [],
