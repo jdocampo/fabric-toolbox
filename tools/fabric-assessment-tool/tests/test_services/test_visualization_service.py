@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -156,6 +157,75 @@ def sample_databricks_assessment_dir(tmp_path):
     return tmp_path
 
 
+@pytest.fixture
+def sample_synapse_column_assessment_dir(sample_synapse_assessment_dir):
+    workspace_dir = sample_synapse_assessment_dir / "test-workspace"
+    column_summary = {
+        "collection_status": "partial",
+        "generated_at": "2026-01-01T00:00:00",
+        "configured_max_column_objects": 50,
+        "wide_object_threshold": 100,
+        "total_objects_considered": 4,
+        "total_objects_collected": 3,
+        "total_columns": 125,
+        "nullable_columns": 25,
+        "data_types": [
+            {
+                "data_type": "int",
+                "column_count": 100,
+                "compatibility": "compatible",
+                "compatibility_note": "Directly supported.",
+            },
+            {
+                "data_type": "xml",
+                "column_count": 25,
+                "compatibility": "unsupported",
+                "compatibility_note": "No direct target representation.",
+            },
+        ],
+        "compatibility_totals": {
+            "compatible": 100,
+            "review": 0,
+            "unsupported": 25,
+        },
+        "wide_objects": [
+            {
+                "database": "warehouse",
+                "schema": "dbo",
+                "object_type": "view",
+                "name": "wide_view",
+                "column_count": 100,
+            }
+        ],
+        "database_statuses": [
+            {
+                "database": "warehouse",
+                "database_type": "dedicated",
+                "status": "capped",
+                "objects_considered": 3,
+                "objects_collected": 2,
+                "columns_collected": 125,
+                "reason": "Capped.",
+            },
+            {
+                "database": "serverless",
+                "database_type": "serverless",
+                "status": "unavailable",
+                "objects_considered": 1,
+                "objects_collected": 0,
+                "columns_collected": 0,
+                "reason": "Unavailable.",
+            },
+        ],
+        "capped_databases": ["warehouse"],
+        "unavailable_databases": ["serverless"],
+        "skipped_reason": None,
+    }
+    with open(workspace_dir / "column_summary.json", "w") as file:
+        json.dump(column_summary, file)
+    return sample_synapse_assessment_dir
+
+
 class TestVisualizationService:
     """Tests for VisualizationService."""
 
@@ -214,6 +284,79 @@ class TestVisualizationService:
         assert ws["platform"] == "synapse"
         assert "summary" in ws
         assert "resources" in ws
+        assert ws["column_summary"] is None
+
+    def test_loads_and_aggregates_column_summary(
+        self, visualization_service, sample_synapse_column_assessment_dir
+    ):
+        data = visualization_service._load_assessment_data(
+            sample_synapse_column_assessment_dir
+        )
+
+        workspace = data["workspaces"]["test-workspace"]
+        assert workspace["column_summary"]["total_columns"] == 125
+        assert data["summary"]["total_columns"] == 125
+        assert data["summary"]["column_compatibility"]["unsupported"] == 25
+        assert data["summary"]["column_type_totals"][0]["data_type"] == "int"
+        assert data["summary"]["wide_objects"][0]["workspace"] == "test-workspace"
+
+        warehousing = visualization_service._aggregate_data_warehousing(
+            data["workspaces"]
+        )
+        assert warehousing["total_columns"] == 125
+        assert warehousing["wide_objects"][0]["name"] == "wide_view"
+        assert (
+            warehousing["column_type_distribution"][0]["workspace"] == "test-workspace"
+        )
+
+    def test_dedicated_pool_metrics_are_not_duplicated(self, visualization_service):
+        workspaces = {
+            "ws1": {
+                "platform": "synapse",
+                "summary": {
+                    "data_warehouse": {
+                        "counts": {
+                            "dedicated": {
+                                "tables": 30,
+                                "table_size_gb": 12.5,
+                            },
+                            "serverless": {},
+                        }
+                    }
+                },
+                "resources": {
+                    "sql_pools": [
+                        {
+                            "type": "dedicated_pool",
+                            "pool_data": {
+                                "name": "pool1",
+                                "sku": "DW100c",
+                                "tables_count": 10,
+                                "size_gb": 5.0,
+                            },
+                        },
+                        {
+                            "type": "dedicated_pool",
+                            "pool_data": {
+                                "name": "pool2",
+                                "sku": "DW100c",
+                                "tables_count": 20,
+                                "size_gb": 7.5,
+                            },
+                        },
+                    ]
+                },
+            }
+        }
+
+        warehousing = visualization_service._aggregate_data_warehousing(workspaces)
+
+        assert warehousing["total_tables"] == 30
+        assert warehousing["total_size_gb"] == 12.5
+        assert [pool["tables_count"] for pool in warehousing["dedicated_pools"]] == [
+            10,
+            20,
+        ]
 
     def test_load_assessment_data_databricks(
         self, visualization_service, sample_databricks_assessment_dir
@@ -274,6 +417,7 @@ class TestVisualizationService:
         assert summary["total_pipelines"] == 10
         assert summary["total_tables"] == 50
         assert summary["platforms"]["synapse"] == 1
+        assert summary["column_collection_statuses"]["legacy_no_data"] == 1
 
     def test_calculate_summary_databricks(self, visualization_service):
         """Test summary calculation for Databricks workspaces."""
@@ -329,6 +473,94 @@ class TestVisualizationService:
             html = f.read()
             assert "Assessment Report" in html
             assert "test-workspace" in html
+
+    def test_rendered_column_analysis_supports_filtering(
+        self,
+        visualization_service,
+        sample_synapse_column_assessment_dir,
+        tmp_path,
+    ):
+        output_dir = tmp_path / "reports"
+
+        visualization_service.generate_report(
+            input_path=str(sample_synapse_column_assessment_dir),
+            output_path=str(output_dir),
+        )
+
+        overview = (output_dir / "index.html").read_text(encoding="utf-8")
+        warehouse = (output_dir / "views" / "data_warehousing.html").read_text(
+            encoding="utf-8"
+        )
+        workspace = (output_dir / "workspaces" / "test-workspace.html").read_text(
+            encoding="utf-8"
+        )
+        for html in (overview, warehouse, workspace):
+            assert "Column Metadata and Fabric Compatibility" in html
+            assert "wide_view" in html
+            assert "Unsupported" in html
+        assert "columnTypeChart" in overview
+        assert 'data-workspace="test-workspace"' in warehouse
+        assert "updateFilteredStats" in warehouse
+
+    def test_column_filter_data_preserves_multiple_workspace_attribution(
+        self,
+        visualization_service,
+        sample_synapse_column_assessment_dir,
+        tmp_path,
+    ):
+        source = sample_synapse_column_assessment_dir / "test-workspace"
+        second = sample_synapse_column_assessment_dir / "second-workspace"
+        shutil.copytree(source, second)
+        with open(second / "summary.json", encoding="utf-8") as file:
+            second_summary = json.load(file)
+        second_summary["workspace_info"]["name"] = "second-workspace"
+        with open(second / "summary.json", "w", encoding="utf-8") as file:
+            json.dump(second_summary, file)
+        with open(second / "column_summary.json", encoding="utf-8") as file:
+            second_columns = json.load(file)
+        second_columns["total_columns"] = 10
+        second_columns["nullable_columns"] = 2
+        second_columns["data_types"] = [
+            {
+                "data_type": "varchar",
+                "column_count": 10,
+                "compatibility": "review",
+                "compatibility_note": "Review character length.",
+            }
+        ]
+        second_columns["compatibility_totals"] = {
+            "compatible": 0,
+            "review": 10,
+            "unsupported": 0,
+        }
+        second_columns["wide_objects"] = [
+            {
+                "database": "warehouse",
+                "schema": "dbo",
+                "object_type": "table",
+                "name": "second_wide_table",
+                "column_count": 100,
+            }
+        ]
+        with open(second / "column_summary.json", "w", encoding="utf-8") as file:
+            json.dump(second_columns, file)
+
+        output_dir = tmp_path / "reports"
+        visualization_service.generate_report(
+            input_path=str(sample_synapse_column_assessment_dir),
+            output_path=str(output_dir),
+        )
+
+        overview = (output_dir / "index.html").read_text(encoding="utf-8")
+        warehouse = (output_dir / "views" / "data_warehousing.html").read_text(
+            encoding="utf-8"
+        )
+        for html in (overview, warehouse):
+            assert "test-workspace" in html
+            assert "second-workspace" in html
+            assert "second_wide_table" in html
+            assert 'data-workspace="second-workspace"' in html
+            assert "data_types:" in html
 
     def test_generate_report_admin_view(
         self, visualization_service, sample_synapse_assessment_dir, tmp_path

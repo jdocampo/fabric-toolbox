@@ -5,6 +5,15 @@ from ..services.assessment_service import AssessmentService
 from .base import BaseCommand
 
 
+def positive_int(value: str) -> int:
+    """Argparse type requiring a positive integer."""
+
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 class AssessCommand(BaseCommand):
     """Command for assessing data sources."""
 
@@ -20,6 +29,7 @@ class AssessCommand(BaseCommand):
 Examples:
   fat assess --source synapse --mode full --ws workspace1,workspace2 -o output_dir/
   fat assess --source synapse --mode full --ws workspace1 --subscription-id 12345678-1234-1234-1234-123456789012 -o output_dir/
+  fat assess --source synapse --mode full --ws workspace1 --max-column-objects 500 -o output_dir/
   fat assess --source databricks --mode full --ws my-workspace --output results/ --format json
         """
 
@@ -85,6 +95,24 @@ Examples:
             help="Auto-create vTableSizes DMV without confirmation prompt (for non-interactive execution)",
         )
 
+        parser.add_argument(
+            "--skip-columns",
+            action="store_true",
+            default=False,
+            help="Skip ODBC column metadata collection and compatibility summaries",
+        )
+
+        parser.add_argument(
+            "--max-column-objects",
+            type=positive_int,
+            default=None,
+            metavar="N",
+            help=(
+                "Collect columns for at most N tables/views per database, "
+                "ordered deterministically without partial objects"
+            ),
+        )
+
         # SQL authentication mode options for dedicated SQL pools
         parser.add_argument(
             "--sql-auth-mode",
@@ -141,6 +169,8 @@ Examples:
                 sql_client_id=getattr(args, "sql_client_id", None),
                 sql_client_secret=getattr(args, "sql_client_secret", None),
                 sql_tenant_id=getattr(args, "sql_tenant_id", None),
+                skip_columns=getattr(args, "skip_columns", False),
+                max_column_objects=getattr(args, "max_column_objects", None),
             )
 
             utils_ui.print(f"Assessment completed successfully!")
@@ -152,7 +182,9 @@ Examples:
                     workspace_name = export_result.get("workspace_name", "Unknown")
                     workspace_dir = export_result.get("workspace_directory", "")
                     total_files = export_result.get("total_files", 0)
-                    utils_ui.print(f"  {workspace_name}: {total_files} files in {workspace_dir}")
+                    utils_ui.print(
+                        f"  {workspace_name}: {total_files} files in {workspace_dir}"
+                    )
 
             # Show detailed status information for each workspace
             if result.get("results"):
@@ -160,12 +192,16 @@ Examples:
                 for workspace_result in result["results"]:
                     workspace_name = workspace_result.get("workspace", "Unknown")
                     status = workspace_result.get("status", "unknown")
-                    
+
                     if status == "success":
                         print(f"  ✓ {workspace_name}: Completed successfully")
                     elif status == "incomplete":
-                        assessment_status = workspace_result.get("assessment_status", {})
-                        description = assessment_status.get("description", "Assessment incomplete")
+                        assessment_status = workspace_result.get(
+                            "assessment_status", {}
+                        )
+                        description = assessment_status.get(
+                            "description", "Assessment incomplete"
+                        )
                         print(f"  ⚠ {workspace_name}: {description}")
                     elif status == "failed":
                         error = workspace_result.get("error", "Unknown error")

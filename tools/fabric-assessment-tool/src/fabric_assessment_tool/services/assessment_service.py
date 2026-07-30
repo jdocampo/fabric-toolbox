@@ -33,6 +33,8 @@ class AssessmentService:
         sql_client_id: Optional[str] = None,
         sql_client_secret: Optional[str] = None,
         sql_tenant_id: Optional[str] = None,
+        skip_columns: bool = False,
+        max_column_objects: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Perform assessment on specified workspaces.
@@ -55,6 +57,8 @@ class AssessmentService:
             sql_client_id: Service principal client ID (required for 'entra-spn' mode)
             sql_client_secret: Service principal client secret (required for 'entra-spn' mode)
             sql_tenant_id: Azure tenant ID (optional for 'entra-spn' mode)
+            skip_columns: Skip Synapse column metadata collection
+            max_column_objects: Optional positive per-database table/view collection cap
 
         Returns:
             Assessment results dictionary
@@ -62,7 +66,7 @@ class AssessmentService:
         # print(f"Initializing {source} client...")
 
         # Get or create client for the source
-        client_kwargs = {}
+        client_kwargs: Dict[str, Any] = {}
         if subscription_id:
             client_kwargs["subscription_id"] = subscription_id
         if auth_method:
@@ -80,10 +84,14 @@ class AssessmentService:
             client_kwargs["sql_client_secret"] = sql_client_secret
         if sql_tenant_id:
             client_kwargs["sql_tenant_id"] = sql_tenant_id
+        if skip_columns:
+            client_kwargs["skip_columns"] = True
+        if max_column_objects is not None:
+            client_kwargs["max_column_objects"] = max_column_objects
         client = self._get_client(source=source, **client_kwargs)
 
         # Perform assessment
-        assessment_results = {
+        assessment_results: Dict[str, Any] = {
             "metadata": {
                 "source": source,
                 "mode": mode,
@@ -91,6 +99,10 @@ class AssessmentService:
                 "timestamp": datetime.now().isoformat(),
                 "version": "0.2.0",
                 "output_format": output_format,
+                "column_collection": {
+                    "skip_columns": skip_columns,
+                    "max_column_objects": max_column_objects,
+                },
             },
             "results": [],
             "summary": {
@@ -101,7 +113,7 @@ class AssessmentService:
             },
         }
 
-        export_results = {"results": []}
+        export_results: Dict[str, Any] = {"results": []}
 
         if not workspaces or len(workspaces) == 0:
             # Get all workspaces from the client and let the client choose which ones to assess

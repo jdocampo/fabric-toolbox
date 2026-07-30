@@ -137,7 +137,7 @@ class VisualizationService:
         self, input_dir: Path, workspace: Optional[str] = None
     ) -> Dict[str, Any]:
         """Load assessment data from JSON files in the input directory."""
-        data = {
+        data: Dict[str, Any] = {
             "workspaces": {},
             "platform": None,
             "generated_at": datetime.now().isoformat(),
@@ -172,12 +172,21 @@ class VisualizationService:
         except (json.JSONDecodeError, IOError):
             return None
 
-        ws_data = {
+        ws_data: Dict[str, Any] = {
             "name": workspace_dir.name,
             "summary": summary,
             "platform": self._detect_platform(summary),
             "resources": {},
+            "column_summary": None,
         }
+
+        column_summary_file = workspace_dir / "column_summary.json"
+        if column_summary_file.exists():
+            try:
+                with open(column_summary_file, "r", encoding="utf-8") as f:
+                    ws_data["column_summary"] = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                ws_data["column_summary"] = None
 
         # Load detailed resources
         resources_dir = workspace_dir / "resources"
@@ -206,7 +215,7 @@ class VisualizationService:
 
     def _load_resources(self, resources_dir: Path) -> Dict[str, List[Dict[str, Any]]]:
         """Load all resources from a resources directory."""
-        resources = {}
+        resources: Dict[str, List[Dict[str, Any]]] = {}
         for category_dir in resources_dir.iterdir():
             if category_dir.is_dir():
                 resources[category_dir.name] = []
@@ -221,7 +230,7 @@ class VisualizationService:
 
     def _load_data_catalog(self, data_dir: Path) -> Dict[str, Any]:
         """Load data catalog information (databases, schemas, tables)."""
-        catalog = {}
+        catalog: Dict[str, Any] = {}
         for subdir in data_dir.iterdir():
             if subdir.is_dir():
                 catalog[subdir.name] = self._load_nested_data(subdir)
@@ -232,7 +241,7 @@ class VisualizationService:
         if depth > 5:  # Prevent infinite recursion
             return {}
 
-        result = {}
+        result: Dict[str, Any] = {}
         for item in directory.iterdir():
             if item.is_file() and item.suffix == ".json":
                 try:
@@ -248,7 +257,7 @@ class VisualizationService:
         self, workspaces: Dict[str, Dict[str, Any]]
     ) -> Dict[str, Any]:
         """Calculate aggregate summary statistics across all workspaces."""
-        summary = {
+        summary: Dict[str, Any] = {
             "workspace_count": len(workspaces),
             "total_notebooks": 0,
             "total_pipelines": 0,
@@ -261,6 +270,17 @@ class VisualizationService:
             "total_clusters": 0,
             "total_jobs": 0,
             "total_sql_warehouses": 0,
+            "total_columns": 0,
+            "total_nullable_columns": 0,
+            "column_compatibility": {
+                "compatible": 0,
+                "review": 0,
+                "unsupported": 0,
+            },
+            "column_collection_statuses": {},
+            "column_type_distribution": [],
+            "column_type_totals": [],
+            "wide_objects": [],
             "platforms": {"synapse": 0, "databricks": 0},
         }
 
@@ -270,15 +290,38 @@ class VisualizationService:
 
             if platform == "synapse":
                 summary["platforms"]["synapse"] += 1
-                self._add_synapse_counts(summary, ws_summary)
+                self._add_synapse_counts(
+                    summary, ws_summary, ws_data.get("column_summary"), ws_name
+                )
             elif platform == "databricks":
                 summary["platforms"]["databricks"] += 1
                 self._add_databricks_counts(summary, ws_summary)
 
+        type_totals: Dict[str, Dict[str, Any]] = {}
+        for entry in summary["column_type_distribution"]:
+            data_type = entry.get("data_type", "unknown")
+            aggregate = type_totals.setdefault(
+                data_type,
+                {
+                    "data_type": data_type,
+                    "column_count": 0,
+                    "compatibility": entry.get("compatibility", "review"),
+                    "compatibility_note": entry.get("compatibility_note", ""),
+                },
+            )
+            aggregate["column_count"] += entry.get("column_count", 0)
+        summary["column_type_totals"] = sorted(
+            type_totals.values(),
+            key=lambda item: (-item["column_count"], item["data_type"]),
+        )
         return summary
 
     def _add_synapse_counts(
-        self, summary: Dict[str, Any], ws_summary: Dict[str, Any]
+        self,
+        summary: Dict[str, Any],
+        ws_summary: Dict[str, Any],
+        column_summary: Optional[Dict[str, Any]] = None,
+        workspace_name: str = "",
     ) -> None:
         """Add Synapse workspace counts to summary."""
         # Data engineering counts - check both nested and flat structures
@@ -312,6 +355,31 @@ class VisualizationService:
         summary["total_tables"] += dw_dedicated.get("tables", 0) + dw_serverless.get(
             "tables", dw.get("total_tables", 0)
         )
+
+        if not isinstance(column_summary, dict):
+            status = "legacy_no_data"
+            summary["column_collection_statuses"][status] = (
+                summary["column_collection_statuses"].get(status, 0) + 1
+            )
+            return
+
+        status = column_summary.get("collection_status", "unavailable")
+        summary["column_collection_statuses"][status] = (
+            summary["column_collection_statuses"].get(status, 0) + 1
+        )
+        summary["total_columns"] += column_summary.get("total_columns", 0)
+        summary["total_nullable_columns"] += column_summary.get("nullable_columns", 0)
+        compatibility = column_summary.get("compatibility_totals", {})
+        for classification in ("compatible", "review", "unsupported"):
+            summary["column_compatibility"][classification] += compatibility.get(
+                classification, 0
+            )
+        for entry in column_summary.get("data_types", []):
+            summary["column_type_distribution"].append(
+                {**entry, "workspace": workspace_name}
+            )
+        for wide_object in column_summary.get("wide_objects", []):
+            summary["wide_objects"].append({**wide_object, "workspace": workspace_name})
 
     def _add_databricks_counts(
         self, summary: Dict[str, Any], ws_summary: Dict[str, Any]
@@ -539,7 +607,7 @@ class VisualizationService:
         self, workspaces: Dict[str, Dict[str, Any]]
     ) -> Dict[str, Any]:
         """Aggregate admin-related data across workspaces."""
-        admin = {
+        admin: Dict[str, Any] = {
             "integration_runtimes": [],
             "linked_services": [],
             "managed_private_endpoints": [],
@@ -581,7 +649,7 @@ class VisualizationService:
         self, workspaces: Dict[str, Dict[str, Any]], platform: str = "synapse"
     ) -> Dict[str, Any]:
         """Aggregate data engineering resources across workspaces."""
-        de = {
+        de: Dict[str, Any] = {
             "notebooks": [],
             "spark_pools": [],
             "spark_job_definitions": [],
@@ -643,9 +711,11 @@ class VisualizationService:
                     cl_data = cl.get("cluster_data") or cl.get("data") or cl
                     cl_data["workspace"] = ws_name
                     de["clusters"].append(cl_data)
-                    version = cl_data.get("spark_version") or (
-                        cl_data.get("json_response") or {}
-                    ).get("spark_version") or "Unknown"
+                    version = (
+                        cl_data.get("spark_version")
+                        or (cl_data.get("json_response") or {}).get("spark_version")
+                        or "Unknown"
+                    )
                     de["spark_versions"][version] = (
                         de["spark_versions"].get(version, 0) + 1
                     )
@@ -704,7 +774,7 @@ class VisualizationService:
         self, workspaces: Dict[str, Dict[str, Any]], platform: str = "synapse"
     ) -> Dict[str, Any]:
         """Aggregate data warehousing resources across workspaces."""
-        dw = {
+        dw: Dict[str, Any] = {
             "dedicated_pools": [],
             "serverless_pools": [],
             "sql_warehouses": [],
@@ -712,6 +782,17 @@ class VisualizationService:
             "databases": [],
             "total_tables": 0,
             "total_size_gb": 0,
+            "total_columns": 0,
+            "nullable_columns": 0,
+            "compatibility_totals": {
+                "compatible": 0,
+                "review": 0,
+                "unsupported": 0,
+            },
+            "column_type_distribution": [],
+            "column_type_totals": [],
+            "wide_objects": [],
+            "column_collection_statuses": [],
         }
 
         for ws_name, ws_data in workspaces.items():
@@ -725,6 +806,60 @@ class VisualizationService:
                 dw_counts = dw_summary.get("counts", {})
                 dedicated_counts = dw_counts.get("dedicated", {})
                 serverless_counts = dw_counts.get("serverless", {})
+                column_summary = ws_data.get("column_summary")
+                if isinstance(column_summary, dict):
+                    dw["total_columns"] += column_summary.get("total_columns", 0)
+                    dw["nullable_columns"] += column_summary.get("nullable_columns", 0)
+                    compatibility = column_summary.get("compatibility_totals", {})
+                    for classification in (
+                        "compatible",
+                        "review",
+                        "unsupported",
+                    ):
+                        dw["compatibility_totals"][classification] += compatibility.get(
+                            classification, 0
+                        )
+                    for entry in column_summary.get("data_types", []):
+                        dw["column_type_distribution"].append(
+                            {**entry, "workspace": ws_name}
+                        )
+                    for wide_object in column_summary.get("wide_objects", []):
+                        dw["wide_objects"].append({**wide_object, "workspace": ws_name})
+                    dw["column_collection_statuses"].append(
+                        {
+                            "workspace": ws_name,
+                            "status": column_summary.get(
+                                "collection_status", "unavailable"
+                            ),
+                            "objects_considered": column_summary.get(
+                                "total_objects_considered", 0
+                            ),
+                            "objects_collected": column_summary.get(
+                                "total_objects_collected", 0
+                            ),
+                            "configured_cap": column_summary.get(
+                                "configured_max_column_objects"
+                            ),
+                            "unavailable_databases": column_summary.get(
+                                "unavailable_databases", []
+                            ),
+                        }
+                    )
+                else:
+                    dw["column_collection_statuses"].append(
+                        {
+                            "workspace": ws_name,
+                            "status": "legacy_no_data",
+                            "objects_considered": None,
+                            "objects_collected": None,
+                            "configured_cap": None,
+                            "unavailable_databases": [],
+                        }
+                    )
+
+                dedicated_pool_count = 0
+                dedicated_table_total = 0
+                dedicated_size_total: float = 0.0
 
                 # SQL pools - try both 'data' and 'pool_data' keys
                 for pool in resources.get("sql_pools", []):
@@ -732,21 +867,19 @@ class VisualizationService:
                     pool_data["workspace"] = ws_name
                     pool_type = pool.get("type", "")
                     if "dedicated" in pool_type.lower() or pool_data.get("sku"):
-                        # Get tables and size from summary if not in pool_data
-                        if pool_data.get("tables_count", 0) == 0:
-                            pool_data["tables_count"] = dedicated_counts.get(
-                                "tables", 0
-                            )
-                        if pool_data.get("size_gb", 0) == 0:
-                            size_val = dedicated_counts.get("table_size_gb", 0)
-                            pool_data["size_gb"] = (
-                                float(size_val)
-                                if isinstance(size_val, str)
-                                else size_val
-                            )
+                        dedicated_pool_count += 1
+                        table_count = pool_data.get("tables_count", 0)
+                        size_value = pool_data.get("size_gb", 0)
+                        size_gb = (
+                            float(size_value)
+                            if isinstance(size_value, str)
+                            else size_value
+                        )
                         dw["dedicated_pools"].append(pool_data)
-                        dw["total_tables"] += pool_data.get("tables_count", 0)
-                        dw["total_size_gb"] += pool_data.get("size_gb", 0)
+                        dw["total_tables"] += table_count
+                        dw["total_size_gb"] += size_gb
+                        dedicated_table_total += table_count
+                        dedicated_size_total += size_gb
                     else:
                         # For serverless, get tables from summary
                         if pool_data.get("tables_count", 0) == 0:
@@ -755,6 +888,16 @@ class VisualizationService:
                             )
                         dw["serverless_pools"].append(pool_data)
                         dw["total_tables"] += pool_data.get("tables_count", 0)
+
+                # Legacy exports did not persist per-pool metrics. Add workspace
+                # totals once without copying them into every dedicated pool row.
+                if dedicated_pool_count and dedicated_table_total == 0:
+                    dw["total_tables"] += dedicated_counts.get("tables", 0)
+                if dedicated_pool_count and dedicated_size_total == 0:
+                    size_value = dedicated_counts.get("table_size_gb", 0)
+                    dw["total_size_gb"] += (
+                        float(size_value) if isinstance(size_value, str) else size_value
+                    )
 
                 # SQL scripts
                 for script in resources.get("sql_scripts", []):
@@ -793,13 +936,34 @@ class VisualizationService:
                     wh_data["workspace"] = ws_name
                     dw["sql_warehouses"].append(wh_data)
 
+        type_totals: Dict[str, Dict[str, Any]] = {}
+        for entry in dw["column_type_distribution"]:
+            data_type = entry.get("data_type", "unknown")
+            aggregate = type_totals.setdefault(
+                data_type,
+                {"data_type": data_type, "column_count": 0},
+            )
+            aggregate["column_count"] += entry.get("column_count", 0)
+        dw["column_type_totals"] = sorted(
+            type_totals.values(),
+            key=lambda item: (-item["column_count"], item["data_type"]),
+        )
+        dw["wide_objects"].sort(
+            key=lambda item: (
+                item.get("workspace", "").lower(),
+                item.get("database", "").lower(),
+                item.get("schema", "").lower(),
+                item.get("object_type", ""),
+                item.get("name", "").lower(),
+            )
+        )
         return dw
 
     def _aggregate_data_integration(
         self, workspaces: Dict[str, Dict[str, Any]]
     ) -> Dict[str, Any]:
         """Aggregate data integration resources across workspaces."""
-        di = {
+        di: Dict[str, Any] = {
             "pipelines": [],
             "dataflows": [],
             "datasets": [],

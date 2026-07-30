@@ -126,6 +126,18 @@ class JSONExporter(BaseExporter):
         files_created = [str(summary_path)]
 
         if isinstance(assessment_data, SynapseAssessment):
+            column_summary_path = workspace_dir / "column_summary.json"
+            column_summary = (
+                asdict(assessment_data.column_summary)
+                if assessment_data.column_summary is not None
+                else {
+                    "collection_status": "unavailable",
+                    "reason": "Column summary was not present in this assessment.",
+                }
+            )
+            with open(column_summary_path, "w") as f:
+                json.dump(column_summary, f, indent=2, cls=DecimalEncoder)
+            files_created.append(str(column_summary_path))
             files_created.extend(self._export_synapse_details(data, workspace_dir))
         elif isinstance(assessment_data, DatabricksAssessment):
             files_created.extend(self._export_databricks_details(data, workspace_dir))
@@ -221,8 +233,9 @@ class JSONExporter(BaseExporter):
                     )
                 files_created.append(str(pool_file))
 
-            # Serverless pools
-            for i, pool in enumerate(data["sql_pools"].get("serverless_pools", [])):
+            # Serverless pool
+            pool = data["sql_pools"].get("serverless_pool")
+            if pool:
                 pool_file = sql_pools_dir / f"serverless_pool_{pool['name']}.json"
                 with open(pool_file, "w") as f:
                     json.dump(
@@ -645,9 +658,7 @@ class JSONExporter(BaseExporter):
             for wh in data["sql_warehouses"].get("sql_warehouses", []):
                 warehouse_id = wh.get("warehouse_id") or "unknown"
                 warehouse_name = wh.get("name") or warehouse_id
-                safe_name = self._safe_filename(
-                    f"{warehouse_name}_{warehouse_id}"
-                )
+                safe_name = self._safe_filename(f"{warehouse_name}_{warehouse_id}")
                 wh_file = sql_wh_dir / f"warehouse_{safe_name}.json"
                 with open(wh_file, "w") as f:
                     json.dump(
