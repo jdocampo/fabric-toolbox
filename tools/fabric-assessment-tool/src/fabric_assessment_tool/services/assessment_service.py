@@ -33,6 +33,15 @@ class AssessmentService:
         sql_client_id: Optional[str] = None,
         sql_client_secret: Optional[str] = None,
         sql_tenant_id: Optional[str] = None,
+        serverless_history_days: int = 30,
+        serverless_top_n: int = 1000,
+        skip_serverless_activity: bool = False,
+        serverless_sql_auth_mode: Optional[str] = None,
+        serverless_sql_username: Optional[str] = None,
+        serverless_sql_password: Optional[str] = None,
+        serverless_sql_client_id: Optional[str] = None,
+        serverless_sql_client_secret: Optional[str] = None,
+        serverless_sql_tenant_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Perform assessment on specified workspaces.
@@ -55,6 +64,15 @@ class AssessmentService:
             sql_client_id: Service principal client ID (required for 'entra-spn' mode)
             sql_client_secret: Service principal client secret (required for 'entra-spn' mode)
             sql_tenant_id: Azure tenant ID (optional for 'entra-spn' mode)
+            serverless_history_days: Number of days of serverless SQL activity to collect
+            serverless_top_n: Maximum number of detailed serverless SQL rows to keep
+            skip_serverless_activity: Skip serverless SQL activity collection
+            serverless_sql_auth_mode: Optional auth-mode override for serverless SQL
+            serverless_sql_username: Optional SQL username override for serverless SQL
+            serverless_sql_password: Optional SQL password override for serverless SQL
+            serverless_sql_client_id: Optional SPN client ID override for serverless SQL
+            serverless_sql_client_secret: Optional SPN secret override for serverless SQL
+            serverless_sql_tenant_id: Optional SPN tenant override for serverless SQL
 
         Returns:
             Assessment results dictionary
@@ -62,7 +80,7 @@ class AssessmentService:
         # print(f"Initializing {source} client...")
 
         # Get or create client for the source
-        client_kwargs = {}
+        client_kwargs: Dict[str, Any] = {}
         if subscription_id:
             client_kwargs["subscription_id"] = subscription_id
         if auth_method:
@@ -80,10 +98,25 @@ class AssessmentService:
             client_kwargs["sql_client_secret"] = sql_client_secret
         if sql_tenant_id:
             client_kwargs["sql_tenant_id"] = sql_tenant_id
+        client_kwargs["serverless_history_days"] = serverless_history_days
+        client_kwargs["serverless_top_n"] = serverless_top_n
+        client_kwargs["skip_serverless_activity"] = skip_serverless_activity
+        if serverless_sql_auth_mode:
+            client_kwargs["serverless_sql_auth_mode"] = serverless_sql_auth_mode
+        if serverless_sql_username:
+            client_kwargs["serverless_sql_username"] = serverless_sql_username
+        if serverless_sql_password is not None:
+            client_kwargs["serverless_sql_password"] = serverless_sql_password
+        if serverless_sql_client_id:
+            client_kwargs["serverless_sql_client_id"] = serverless_sql_client_id
+        if serverless_sql_client_secret:
+            client_kwargs["serverless_sql_client_secret"] = serverless_sql_client_secret
+        if serverless_sql_tenant_id:
+            client_kwargs["serverless_sql_tenant_id"] = serverless_sql_tenant_id
         client = self._get_client(source=source, **client_kwargs)
 
         # Perform assessment
-        assessment_results = {
+        assessment_results: Dict[str, Any] = {
             "metadata": {
                 "source": source,
                 "mode": mode,
@@ -101,7 +134,7 @@ class AssessmentService:
             },
         }
 
-        export_results = {"results": []}
+        export_results: Dict[str, Any] = {"results": []}
 
         if not workspaces or len(workspaces) == 0:
             # Get all workspaces from the client and let the client choose which ones to assess

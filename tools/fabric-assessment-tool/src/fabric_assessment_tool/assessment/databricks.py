@@ -631,9 +631,7 @@ class DatabricksAssessment:
             len(self.genie_spaces.genie_spaces) if self.genie_spaces else 0
         )
         summary["counts"]["cluster_policies"] = (
-            len(self.cluster_policies.cluster_policies)
-            if self.cluster_policies
-            else 0
+            len(self.cluster_policies.cluster_policies) if self.cluster_policies else 0
         )
         summary["counts"]["instance_pools"] = (
             len(self.instance_pools.instance_pools) if self.instance_pools else 0

@@ -142,9 +142,7 @@ class DatabricksClient:
         private_endpoint_conns = properties.get("privateEndpointConnections") or []
         raw_pna = properties.get("publicNetworkAccess")
         managed_rg_id = properties.get("managedResourceGroupId") or ""
-        managed_rg_name = (
-            managed_rg_id.split("/")[-1] if managed_rg_id else None
-        )
+        managed_rg_name = managed_rg_id.split("/")[-1] if managed_rg_id else None
 
         vnet_injected = bool(custom_vnet)
         uses_private_endpoints = (
@@ -182,8 +180,8 @@ class DatabricksClient:
             id=workspace["id"],
             name=workspace["name"],
             resource_group=workspace["id"].split("/")[4],
-            url=properties.get("workspaceUrl"),
-            status=properties.get("provisioningState"),
+            url=properties.get("workspaceUrl") or "",
+            status=properties.get("provisioningState") or "",
             tier=workspace["sku"]["name"],
             location=workspace.get("location"),
             managed_resource_group=managed_rg_name,

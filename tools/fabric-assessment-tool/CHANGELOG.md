@@ -5,6 +5,23 @@ All notable changes to the Fabric Assessment Tool will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Synapse Serverless SQL Activity**: Optional activity collection from the built-in on-demand SQL endpoint with capability-probed DMV/view support, 30-day/1000-row defaults, daily database usage rollups, database summaries, and top slow/large query metrics
+- **Serverless SQL CLI Options**: New `--serverless-history-days`, `--serverless-top-n`, `--skip-serverless-activity`, and `--serverless-sql-*` overrides with inheritance from existing dedicated SQL settings
+
+### Changed
+
+- **Visualization**: Synapse Data Warehousing HTML reports now show serverless activity collection status, processed-byte trends, database breakdowns, and performance summaries while keeping full query text out of HTML
+- **Export**: Structured Synapse export now writes the singular `sql_pools.serverless_pool` payload to `resources/sql_pools/serverless_pool_<name>.json` and preserves the nested serverless activity object in JSON
+
+### Fixed
+
+- **Assess**: Expected serverless connection, permission, unsupported-object, and query-shape failures now degrade to `partial` or `unavailable` activity metadata instead of failing the whole workspace; explicit `--skip-serverless-activity` is treated as a clean skip rather than an incomplete assessment
+- **Export**: Fixed the serverless pool export mismatch between the dataclass (`serverless_pool`) and structured exporter (`serverless_pools`)
+
 ## [0.2.2] - 2026-04-22
 
 ### Added

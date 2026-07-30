@@ -221,8 +221,10 @@ class JSONExporter(BaseExporter):
                     )
                 files_created.append(str(pool_file))
 
-            # Serverless pools
-            for i, pool in enumerate(data["sql_pools"].get("serverless_pools", [])):
+            # Serverless pool
+            serverless_pool = data["sql_pools"].get("serverless_pool")
+            if serverless_pool:
+                pool = serverless_pool
                 pool_file = sql_pools_dir / f"serverless_pool_{pool['name']}.json"
                 with open(pool_file, "w") as f:
                     json.dump(
@@ -645,9 +647,7 @@ class JSONExporter(BaseExporter):
             for wh in data["sql_warehouses"].get("sql_warehouses", []):
                 warehouse_id = wh.get("warehouse_id") or "unknown"
                 warehouse_name = wh.get("name") or warehouse_id
-                safe_name = self._safe_filename(
-                    f"{warehouse_name}_{warehouse_id}"
-                )
+                safe_name = self._safe_filename(f"{warehouse_name}_{warehouse_id}")
                 wh_file = sql_wh_dir / f"warehouse_{safe_name}.json"
                 with open(wh_file, "w") as f:
                     json.dump(
