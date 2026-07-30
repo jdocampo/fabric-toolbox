@@ -33,6 +33,9 @@ class AssessmentService:
         sql_client_id: Optional[str] = None,
         sql_client_secret: Optional[str] = None,
         sql_tenant_id: Optional[str] = None,
+        sql_complexity: bool = False,
+        sql_definition_redaction: str = "full",
+        sql_complexity_schemas: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Perform assessment on specified workspaces.
@@ -55,6 +58,9 @@ class AssessmentService:
             sql_client_id: Service principal client ID (required for 'entra-spn' mode)
             sql_client_secret: Service principal client secret (required for 'entra-spn' mode)
             sql_tenant_id: Azure tenant ID (optional for 'entra-spn' mode)
+            sql_complexity: Enable SQL code complexity scoring
+            sql_definition_redaction: Definition export mode ('full' or 'none')
+            sql_complexity_schemas: Optional schema allowlist for scoring
 
         Returns:
             Assessment results dictionary
@@ -62,7 +68,7 @@ class AssessmentService:
         # print(f"Initializing {source} client...")
 
         # Get or create client for the source
-        client_kwargs = {}
+        client_kwargs: Dict[str, Any] = {}
         if subscription_id:
             client_kwargs["subscription_id"] = subscription_id
         if auth_method:
@@ -80,10 +86,14 @@ class AssessmentService:
             client_kwargs["sql_client_secret"] = sql_client_secret
         if sql_tenant_id:
             client_kwargs["sql_tenant_id"] = sql_tenant_id
+        if source == "synapse":
+            client_kwargs["sql_complexity"] = sql_complexity
+            client_kwargs["sql_definition_redaction"] = sql_definition_redaction
+            client_kwargs["sql_complexity_schemas"] = sql_complexity_schemas or []
         client = self._get_client(source=source, **client_kwargs)
 
         # Perform assessment
-        assessment_results = {
+        assessment_results: Dict[str, Any] = {
             "metadata": {
                 "source": source,
                 "mode": mode,
@@ -101,7 +111,7 @@ class AssessmentService:
             },
         }
 
-        export_results = {"results": []}
+        export_results: Dict[str, Any] = {"results": []}
 
         if not workspaces or len(workspaces) == 0:
             # Get all workspaces from the client and let the client choose which ones to assess

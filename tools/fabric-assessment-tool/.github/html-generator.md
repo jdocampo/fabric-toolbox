@@ -135,6 +135,31 @@ function updateFilteredStats(selectedWorkspaces) {
 
 This is called automatically from `base.html` on selection changes.
 
+## Synapse SQL Complexity Artifacts
+
+When `fat assess --sql-complexity` is enabled, each dedicated or serverless
+database can include:
+
+```text
+complexity/
+├── summary.json
+└── objects/
+    ├── procedures/*.json
+    ├── functions/*.json
+    └── views/*.json
+```
+
+Both summary and object files use the standard `data` wrapper. The recursive
+data-catalog loader therefore exposes them below the database folder as
+`complexity.summary` and `complexity.objects.<type>.<file>`.
+
+`_aggregate_data_warehousing()` adds the workspace and database identity to
+each object, combines level/type distributions, and builds
+`complexity_by_workspace` for client-side filter updates. Complexity templates
+must not assume a definition is present: the secure default exports
+`definition: null`, and encrypted or permission-hidden objects have no score or
+level. Treat HIGH, VERY_HIGH, and unavailable definitions as review items.
+
 ## Charts (Chart.js)
 
 - Chart.js 4.4.1 is loaded from CDN in `base.html`. No package install

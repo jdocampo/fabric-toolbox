@@ -1,5 +1,8 @@
 """Tests for OdbcClient connection string generation and authentication modes."""
 
+from datetime import datetime
+from types import SimpleNamespace
+
 import pytest
 
 from fabric_assessment_tool.clients.odbc_client import OdbcClient
@@ -143,7 +146,9 @@ class TestOdbcClientValidation:
 
     def test_entra_spn_requires_client_id(self):
         """Test that SPN auth mode requires client_id."""
-        with pytest.raises(ValueError, match="Service Principal authentication requires"):
+        with pytest.raises(
+            ValueError, match="Service Principal authentication requires"
+        ):
             OdbcClient(
                 workspace_name="myworkspace",
                 database="mydb",
@@ -153,7 +158,9 @@ class TestOdbcClientValidation:
 
     def test_entra_spn_requires_client_secret(self):
         """Test that SPN auth mode requires client_secret."""
-        with pytest.raises(ValueError, match="Service Principal authentication requires"):
+        with pytest.raises(
+            ValueError, match="Service Principal authentication requires"
+        ):
             OdbcClient(
                 workspace_name="myworkspace",
                 database="mydb",
@@ -218,3 +225,87 @@ class TestOdbcClientDefaults:
         assert client.username == "sqladmin"
         assert client.password == "secret123"
         assert "Uid=sqladmin" in client._connection_string
+
+
+class TestSqlCodeObjectExtraction:
+    def test_extracts_supported_objects_with_metadata(self, monkeypatch):
+        client = OdbcClient(
+            workspace_name="myworkspace",
+            database="mydb",
+            auth_mode="entra-default",
+        )
+        rows = [
+            SimpleNamespace(
+                database_name="mydb",
+                schema_name="dbo",
+                object_name="proc_one",
+                object_type="PROCEDURE",
+                definition="CREATE PROC dbo.proc_one AS SELECT 1;",
+                is_encrypted=False,
+                created_at=datetime(2025, 1, 1),
+                modified_at=datetime(2025, 1, 2),
+                object_id=42,
+                object_type_code="P",
+            )
+        ]
+        monkeypatch.setattr(
+            client, "execute_query", lambda query, parameters: iter(rows)
+        )
+
+        definitions = client.get_sql_code_objects()
+
+        assert len(definitions) == 1
+        definition = definitions[0]
+        assert definition.object_type == "PROCEDURE"
+        assert definition.definition.startswith("CREATE PROC")
+        assert definition.created_at == "2025-01-01T00:00:00"
+        assert definition.json_response["object_type_code"] == "P"
+
+    def test_schema_filter_is_parameterized_and_case_insensitive(self, monkeypatch):
+        client = OdbcClient(
+            workspace_name="myworkspace",
+            database="mydb",
+            auth_mode="entra-default",
+        )
+        captured = {}
+
+        def execute_query(query, parameters):
+            captured["query"] = query
+            captured["parameters"] = parameters
+            return iter([])
+
+        monkeypatch.setattr(client, "execute_query", execute_query)
+
+        client.get_sql_code_objects(["Sales", "Reporting"])
+
+        assert "LOWER(s.name) IN (?, ?)" in captured["query"]
+        assert captured["parameters"] == ["sales", "reporting"]
+
+    def test_preserves_null_encrypted_definition(self, monkeypatch):
+        client = OdbcClient(
+            workspace_name="myworkspace",
+            database="mydb",
+            auth_mode="entra-default",
+        )
+        rows = [
+            SimpleNamespace(
+                database_name="mydb",
+                schema_name="dbo",
+                object_name="secret_proc",
+                object_type="PROCEDURE",
+                definition=None,
+                is_encrypted=True,
+                created_at=None,
+                modified_at=None,
+                object_id=99,
+                object_type_code="P",
+            )
+        ]
+        monkeypatch.setattr(
+            client, "execute_query", lambda query, parameters: iter(rows)
+        )
+
+        definition = client.get_sql_code_objects()[0]
+
+        assert definition.definition is None
+        assert definition.is_encrypted is True

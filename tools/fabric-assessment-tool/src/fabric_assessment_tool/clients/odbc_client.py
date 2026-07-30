@@ -1,8 +1,13 @@
-from typing import Any, Iterator, Literal, Optional
+from typing import Any, Iterator, Literal, Optional, Sequence
 
-from mssql_python import connect
+from mssql_python import connect  # type: ignore[import-untyped]
 
-from ..assessment.synapse import CodeObjectCount, CodeObjectLines, TableStatistics
+from ..assessment.synapse import (
+    CodeObjectCount,
+    CodeObjectLines,
+    SqlCodeObjectDefinition,
+    TableStatistics,
+)
 
 # Supported SQL authentication modes
 SqlAuthMode = Literal["sql", "entra-interactive", "entra-spn", "entra-default"]
@@ -96,8 +101,7 @@ class OdbcClient:
             # Service Principal authentication
             # UID = client_id, PWD = client_secret
             return (
-                base
-                + f"Authentication=ActiveDirectoryServicePrincipal;"
+                base + f"Authentication=ActiveDirectoryServicePrincipal;"
                 f"UID={self.client_id};"
                 f"PWD={self.client_secret};"
             )
@@ -140,7 +144,9 @@ class OdbcClient:
             self.open()
         return self._connection
 
-    def execute_query(self, query: str) -> Iterator[Any]:
+    def execute_query(
+        self, query: str, parameters: Optional[Sequence[Any]] = None
+    ) -> Iterator[Any]:
         """
         Execute a SQL query and yield results row by row.
 
@@ -152,9 +158,81 @@ class OdbcClient:
         """
         conn = self._ensure_connection()
         with conn.cursor() as cursor:
-            cursor.execute(query)
+            if parameters:
+                cursor.execute(query, parameters)
+            else:
+                cursor.execute(query)
             for row in cursor:
                 yield row
+
+    def get_sql_code_objects(
+        self, schema_names: Optional[list[str]] = None
+    ) -> list[SqlCodeObjectDefinition]:
+        """Extract procedure, function, and view definitions in one query."""
+        schema_filter = ""
+        parameters: list[Any] = []
+        if schema_names:
+            placeholders = ", ".join("?" for _ in schema_names)
+            schema_filter = f"AND LOWER(s.name) IN ({placeholders})"
+            parameters.extend(schema_name.lower() for schema_name in schema_names)
+
+        query = f"""
+SELECT
+    DB_NAME() AS database_name,
+    s.name AS schema_name,
+    o.name AS object_name,
+    CASE
+        WHEN o.type = 'P' THEN 'PROCEDURE'
+        WHEN o.type = 'V' THEN 'VIEW'
+        ELSE 'FUNCTION'
+    END AS object_type,
+    m.definition AS definition,
+    CAST(OBJECTPROPERTYEX(o.object_id, 'IsEncrypted') AS bit) AS is_encrypted,
+    o.create_date AS created_at,
+    o.modify_date AS modified_at,
+    o.object_id AS object_id,
+    o.type AS object_type_code
+FROM sys.objects AS o
+INNER JOIN sys.schemas AS s
+    ON o.schema_id = s.schema_id
+LEFT JOIN sys.sql_modules AS m
+    ON o.object_id = m.object_id
+WHERE o.type IN ('P', 'V', 'FN', 'IF', 'TF')
+  AND o.is_ms_shipped = 0
+  AND s.name NOT IN ('sys', 'INFORMATION_SCHEMA')
+  {schema_filter}
+ORDER BY s.name, o.name
+"""
+
+        definitions = []
+        for row in self.execute_query(query, parameters):
+            created_at = self._format_datetime(row.created_at)
+            modified_at = self._format_datetime(row.modified_at)
+            definitions.append(
+                SqlCodeObjectDefinition(
+                    database_name=row.database_name,
+                    schema_name=row.schema_name,
+                    object_name=row.object_name,
+                    object_type=row.object_type,
+                    definition=row.definition,
+                    is_encrypted=bool(row.is_encrypted),
+                    created_at=created_at,
+                    modified_at=modified_at,
+                    json_response={
+                        "object_id": row.object_id,
+                        "object_type_code": row.object_type_code,
+                    },
+                )
+            )
+        return definitions
+
+    @staticmethod
+    def _format_datetime(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if hasattr(value, "isoformat"):
+            return value.isoformat()
+        return str(value)
 
     def get_schemas(self) -> list[str]:
         """Get schema names from the dedicated SQL pool.

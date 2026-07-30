@@ -48,7 +48,9 @@ Examples:
 
         parser.add_argument(
             "-ws",
+            "--ws",
             "--workspace",
+            dest="workspace",
             default="",
             help="Comma-separated list of workspace names to assess",
         )
@@ -117,6 +119,26 @@ Examples:
             help="Azure tenant ID for Entra ID SPN authentication (optional, defaults to 'common')",
         )
 
+        parser.add_argument(
+            "--sql-complexity",
+            action="store_true",
+            default=False,
+            help="Enable SQL complexity scoring for procedures, functions, and views",
+        )
+
+        parser.add_argument(
+            "--sql-definition-redaction",
+            choices=["full", "none"],
+            default="full",
+            help="Definition export mode for SQL complexity results (default: full)",
+        )
+
+        parser.add_argument(
+            "--sql-complexity-schemas",
+            default="",
+            help="Comma-separated schema allowlist for SQL complexity scoring",
+        )
+
     def handle(self, args: argparse.Namespace) -> None:
         """Handle the assess command execution."""
         print(f"Starting assessment of {args.source} workspaces...")
@@ -125,6 +147,21 @@ Examples:
         workspaces = [
             ws.strip() for ws in args.workspace.split(",") if ws.strip() != ""
         ]
+        complexity_schemas = [
+            schema.strip()
+            for schema in getattr(args, "sql_complexity_schemas", "").split(",")
+            if schema.strip()
+        ]
+
+        if args.source != "synapse" and getattr(args, "sql_complexity", False):
+            raise ValueError("--sql-complexity is only supported for Synapse")
+        if not getattr(args, "sql_complexity", False) and (
+            getattr(args, "sql_definition_redaction", "full") != "full"
+            or complexity_schemas
+        ):
+            raise ValueError(
+                "--sql-definition-redaction and --sql-complexity-schemas require --sql-complexity"
+            )
 
         try:
             result = self.assessment_service.assess(
@@ -141,6 +178,11 @@ Examples:
                 sql_client_id=getattr(args, "sql_client_id", None),
                 sql_client_secret=getattr(args, "sql_client_secret", None),
                 sql_tenant_id=getattr(args, "sql_tenant_id", None),
+                sql_complexity=getattr(args, "sql_complexity", False),
+                sql_definition_redaction=getattr(
+                    args, "sql_definition_redaction", "full"
+                ),
+                sql_complexity_schemas=complexity_schemas,
             )
 
             utils_ui.print(f"Assessment completed successfully!")
@@ -152,7 +194,9 @@ Examples:
                     workspace_name = export_result.get("workspace_name", "Unknown")
                     workspace_dir = export_result.get("workspace_directory", "")
                     total_files = export_result.get("total_files", 0)
-                    utils_ui.print(f"  {workspace_name}: {total_files} files in {workspace_dir}")
+                    utils_ui.print(
+                        f"  {workspace_name}: {total_files} files in {workspace_dir}"
+                    )
 
             # Show detailed status information for each workspace
             if result.get("results"):
@@ -160,12 +204,16 @@ Examples:
                 for workspace_result in result["results"]:
                     workspace_name = workspace_result.get("workspace", "Unknown")
                     status = workspace_result.get("status", "unknown")
-                    
+
                     if status == "success":
                         print(f"  ✓ {workspace_name}: Completed successfully")
                     elif status == "incomplete":
-                        assessment_status = workspace_result.get("assessment_status", {})
-                        description = assessment_status.get("description", "Assessment incomplete")
+                        assessment_status = workspace_result.get(
+                            "assessment_status", {}
+                        )
+                        description = assessment_status.get(
+                            "description", "Assessment incomplete"
+                        )
                         print(f"  ⚠ {workspace_name}: {description}")
                     elif status == "failed":
                         error = workspace_result.get("error", "Unknown error")

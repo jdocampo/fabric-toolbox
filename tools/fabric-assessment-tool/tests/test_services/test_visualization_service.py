@@ -102,6 +102,93 @@ def sample_synapse_assessment_dir(tmp_path):
     with open(ls_dir / "AzureBlobStorage1.json", "w") as f:
         json.dump(ls_data, f)
 
+    # Create SQL complexity data
+    database_dir = (
+        workspace_dir / "data" / "dedicated_databases" / "databases" / "warehouse"
+    )
+    database_dir.mkdir(parents=True)
+    with open(database_dir / "warehouse.json", "w") as f:
+        json.dump(
+            {
+                "type": "dedicated_database",
+                "data": {"name": "warehouse", "pool_name": "warehouse"},
+            },
+            f,
+        )
+
+    complexity_dir = database_dir / "complexity"
+    complexity_dir.mkdir()
+    with open(complexity_dir / "summary.json", "w") as f:
+        json.dump(
+            {
+                "type": "sql_complexity_summary",
+                "data": {
+                    "status": "incomplete",
+                    "rubric_version": "1.0",
+                    "total_objects": 3,
+                    "scored_objects": 2,
+                    "unavailable_definitions": 1,
+                    "distribution": {
+                        "LOW": 1,
+                        "MEDIUM": 0,
+                        "HIGH": 1,
+                        "VERY_HIGH": 0,
+                    },
+                    "by_type": {
+                        "VIEW": {
+                            "total": 2,
+                            "LOW": 1,
+                            "MEDIUM": 0,
+                            "HIGH": 0,
+                            "VERY_HIGH": 0,
+                            "unavailable": 1,
+                        },
+                        "PROCEDURE": {
+                            "total": 1,
+                            "LOW": 0,
+                            "MEDIUM": 0,
+                            "HIGH": 1,
+                            "VERY_HIGH": 0,
+                            "unavailable": 0,
+                        },
+                    },
+                    "objects_needing_review": 2,
+                    "readiness_percentage": 50.0,
+                    "readiness_indicator": "REVIEW",
+                    "elapsed_seconds": 0.2,
+                    "errors": [],
+                },
+            },
+            f,
+        )
+
+    procedures_dir = complexity_dir / "objects" / "procedures"
+    procedures_dir.mkdir(parents=True)
+    with open(procedures_dir / "dbo.high_proc.json", "w") as f:
+        json.dump(
+            {
+                "type": "sql_complexity_object",
+                "data": {
+                    "database_name": "warehouse",
+                    "schema_name": "dbo",
+                    "object_name": "high_proc",
+                    "object_type": "PROCEDURE",
+                    "definition_status": "available",
+                    "definition": None,
+                    "definition_length": 100,
+                    "definition_hash": "hash",
+                    "line_count": 10,
+                    "score": 8,
+                    "complexity_level": "HIGH",
+                    "matched_rules": ["cursor"],
+                    "escalation_reasons": ["Uses a cursor"],
+                    "created_at": None,
+                    "modified_at": None,
+                },
+            },
+            f,
+        )
+
     return tmp_path
 
 
@@ -435,6 +522,24 @@ class TestVisualizationService:
         assert de["notebook_languages"]["Scala"] == 1
         assert len(de["spark_pools"]) == 1
 
+    def test_aggregate_sql_complexity(
+        self, visualization_service, sample_synapse_assessment_dir
+    ):
+        data = visualization_service._load_assessment_data(
+            sample_synapse_assessment_dir
+        )
+
+        warehousing = visualization_service._aggregate_data_warehousing(
+            data["workspaces"]
+        )
+
+        assert warehousing["complexity_scored_objects"] == 2
+        assert warehousing["complexity_unavailable_definitions"] == 1
+        assert warehousing["complexity_distribution"]["HIGH"] == 1
+        assert warehousing["complexity_readiness_percentage"] == 50.0
+        assert warehousing["complexity_readiness_indicator"] == "REVIEW"
+        assert warehousing["complexity_objects"][0]["workspace"] == "test-workspace"
+
     def test_generate_workspace_report(
         self, visualization_service, sample_synapse_assessment_dir, tmp_path
     ):
@@ -455,6 +560,25 @@ class TestVisualizationService:
         with open(ws_file, "r", encoding="utf-8") as f:
             html = f.read()
             assert "test-workspace" in html
+
+    def test_data_warehousing_report_contains_complexity(
+        self, visualization_service, sample_synapse_assessment_dir, tmp_path
+    ):
+        output_dir = tmp_path / "reports"
+
+        visualization_service.generate_report(
+            input_path=str(sample_synapse_assessment_dir),
+            output_path=str(output_dir),
+            view="data-warehousing",
+        )
+
+        html = (output_dir / "views" / "data_warehousing.html").read_text(
+            encoding="utf-8"
+        )
+        assert "SQL Migration Readiness" in html
+        assert "Objects Needing Review" in html
+        assert "dbo.high_proc" in html
+        assert "complexityWorkspaceData" in html
 
     def test_empty_input_directory(self, visualization_service, tmp_path):
         """Test handling of empty input directory."""
