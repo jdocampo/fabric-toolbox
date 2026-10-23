@@ -1,5 +1,7 @@
 import json
+import io
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime
 from decimal import Decimal
@@ -11,6 +13,53 @@ from ..assessment.databricks import DatabricksAssessment
 # Import assessment dataclasses
 from ..assessment.synapse import SynapseAssessment
 from ..utils import ui as utils_ui
+from ..utils.output_paths import (
+    OutputPathAdapter,
+    format_path_error,
+)
+
+
+class ExportPlan:
+    """Ordered filesystem operations rendered before any workspace mutation."""
+
+    def __init__(self, adapter: OutputPathAdapter) -> None:
+        self.adapter = adapter
+        self.operations: list[tuple[str, str, Any]] = []
+
+    def add_directory(self, path: Path, *, parents: bool, exist_ok: bool) -> None:
+        self.operations.append(
+            ("mkdir", self.adapter.normalize(path), (parents, exist_ok))
+        )
+
+    def add_write(self, path: Path, content: str) -> None:
+        self.operations.append(("write", self.adapter.normalize(path), content))
+
+    def add_remove_tree(self, path: Path) -> None:
+        self.operations.append(("remove_tree", self.adapter.normalize(path), None))
+
+    @property
+    def files(self) -> list[str]:
+        return [path for operation, path, _ in self.operations if operation == "write"]
+
+    @property
+    def directories(self) -> list[str]:
+        return [
+            path for operation, path, _ in self.operations if operation == "mkdir"
+        ] + [
+            path for operation, path, _ in self.operations if operation == "remove_tree"
+        ]
+
+    def execute(self) -> None:
+        for operation, path, value in self.operations:
+            if operation == "mkdir":
+                parents, exist_ok = value
+                self.adapter.mkdir(path, parents=parents, exist_ok=exist_ok)
+            elif operation == "remove_tree":
+                if self.adapter.exists(path):
+                    self.adapter.remove_tree(path)
+            else:
+                with self.adapter.open(path, "w", encoding="utf-8") as stream:
+                    stream.write(value)
 
 
 class DecimalEncoder(json.JSONEncoder):
@@ -29,6 +78,9 @@ class BaseExporter(ABC):
         assessment_data: Union[SynapseAssessment, DatabricksAssessment],
         output_path: str,
         workspace_name: str,
+        *,
+        output_adapter: Optional[OutputPathAdapter] = None,
+        legacy_path_limit: bool = False,
     ) -> Dict[str, Any]:
         """Export assessment data in specific format."""
         pass
@@ -37,7 +89,41 @@ class BaseExporter(ABC):
 class JSONExporter(BaseExporter):
     """JSON format exporter with structured folder output."""
 
+    def __init__(self) -> None:
+        self._adapter: Optional[OutputPathAdapter] = None
+        self._plan: Optional[ExportPlan] = None
+
     def export(
+        self,
+        assessment_data: Union[SynapseAssessment, DatabricksAssessment],
+        output_path: str,
+        workspace_name: str,
+        resources: Optional[List[str]] = None,
+        *,
+        output_adapter: Optional[OutputPathAdapter] = None,
+        legacy_path_limit: bool = False,
+    ) -> Dict[str, Any]:
+        self._adapter = output_adapter or OutputPathAdapter(output_path)
+        self._plan = ExportPlan(self._adapter)
+        try:
+            result = self._render_export(
+                assessment_data, output_path, workspace_name, resources=resources
+            )
+            path_error = format_path_error(
+                workspace_name,
+                self._adapter,
+                self._plan.files,
+                self._plan.directories,
+                legacy_limit=legacy_path_limit,
+            )
+            if path_error:
+                raise path_error
+            self._plan.execute()
+            return result
+        finally:
+            self._plan = None
+
+    def _render_export(
         self,
         assessment_data: Union[SynapseAssessment, DatabricksAssessment],
         output_path: str,
@@ -51,7 +137,7 @@ class JSONExporter(BaseExporter):
         cleared and rewritten. Summary is always rewritten.
         """
         workspace_dir = Path(output_path) / workspace_name
-        workspace_dir.mkdir(parents=True, exist_ok=True)
+        self._mkdir(workspace_dir, parents=True, exist_ok=True)
 
         # Convert dataclass to dictionary
         data = asdict(assessment_data)
@@ -61,9 +147,9 @@ class JSONExporter(BaseExporter):
 
         # In partial mode, preserve existing summary counts for resources not re-extracted
         summary_path = workspace_dir / "summary.json"
-        if resources and summary_path.exists():
+        if resources and self._exists(summary_path):
             try:
-                with open(summary_path, "r", encoding="utf-8") as f:
+                with self._open(summary_path, "r", encoding="utf-8") as f:
                     existing_summary = json.load(f)
                 existing_counts = existing_summary.get("counts", {})
                 new_counts = summary.get("counts", {})
@@ -102,7 +188,7 @@ class JSONExporter(BaseExporter):
             except (json.JSONDecodeError, IOError):
                 pass
 
-        with open(summary_path, "w") as f:
+        with self._open(summary_path, "w") as f:
             json.dump(summary, f, indent=2, cls=DecimalEncoder)
 
         # Export detailed components to separate folders
@@ -124,6 +210,44 @@ class JSONExporter(BaseExporter):
             "total_files": len(files_created),
         }
 
+    @contextmanager
+    def _open(self, path: Path, mode: str, **kwargs):
+        if self._adapter is None:
+            raise RuntimeError("Output path adapter is not configured.")
+        if "r" in mode:
+            with self._adapter.open(path, mode, **kwargs) as stream:
+                yield stream
+            return
+
+        if self._plan is None:
+            raise RuntimeError("Export plan is not active.")
+        buffer = io.StringIO()
+        try:
+            yield buffer
+        except BaseException:
+            raise
+        else:
+            self._plan.add_write(path, buffer.getvalue())
+        finally:
+            buffer.close()
+
+    def _mkdir(
+        self, path: Path, *, parents: bool = False, exist_ok: bool = False
+    ) -> None:
+        if self._plan is None:
+            raise RuntimeError("Export plan is not active.")
+        self._plan.add_directory(path, parents=parents, exist_ok=exist_ok)
+
+    def _exists(self, path: Path) -> bool:
+        if self._adapter is None:
+            raise RuntimeError("Output path adapter is not configured.")
+        return self._adapter.exists(path)
+
+    def _remove_tree(self, path: Path) -> None:
+        if self._plan is None:
+            raise RuntimeError("Export plan is not active.")
+        self._plan.add_remove_tree(path)
+
     def _export_component(
         self,
         data,
@@ -141,11 +265,11 @@ class JSONExporter(BaseExporter):
 
         if key in data:
             component_dir = resources_dir / folder_name
-            component_dir.mkdir(exist_ok=True)
+            self._mkdir(component_dir, exist_ok=True)
 
             for item in data[key].get(property, []):
                 file_path = component_dir / f"{item['name']}.json"
-                with open(file_path, "w") as f:
+                with self._open(file_path, "w") as f:
                     json.dump(
                         {
                             "type": file_type,
@@ -166,11 +290,11 @@ class JSONExporter(BaseExporter):
 
         # Create workspace directory
         ws_dir = workspace_dir
-        ws_dir.mkdir(exist_ok=True)
+        self._mkdir(ws_dir, exist_ok=True)
 
         # Export general workspace info
         workspace_info_file = ws_dir / "workspace.json"
-        with open(workspace_info_file, "w") as f:
+        with self._open(workspace_info_file, "w") as f:
             json.dump(
                 {
                     "type": "synapse_workspace",
@@ -185,17 +309,17 @@ class JSONExporter(BaseExporter):
 
         # Create resources folder
         resources_dir = workspace_dir / "resources"
-        resources_dir.mkdir(exist_ok=True)
+        self._mkdir(resources_dir, exist_ok=True)
 
         # Export SQL pools
         if "sql_pools" in data:
             sql_pools_dir = resources_dir / "sql_pools"
-            sql_pools_dir.mkdir(exist_ok=True)
+            self._mkdir(sql_pools_dir, exist_ok=True)
 
             # Dedicated pools
             for i, pool in enumerate(data["sql_pools"].get("dedicated_pools", [])):
                 pool_file = sql_pools_dir / f"dedicated_pool_{pool['name']}.json"
-                with open(pool_file, "w") as f:
+                with self._open(pool_file, "w") as f:
                     json.dump(
                         {
                             "type": "dedicated_pool",
@@ -211,7 +335,7 @@ class JSONExporter(BaseExporter):
             # Serverless pools
             for i, pool in enumerate(data["sql_pools"].get("serverless_pools", [])):
                 pool_file = sql_pools_dir / f"serverless_pool_{pool['name']}.json"
-                with open(pool_file, "w") as f:
+                with self._open(pool_file, "w") as f:
                     json.dump(
                         {
                             "type": "serverless_pool",
@@ -271,7 +395,7 @@ class JSONExporter(BaseExporter):
 
         # Create admin folder
         admin_dir = workspace_dir / "admin"
-        admin_dir.mkdir(exist_ok=True)
+        self._mkdir(admin_dir, exist_ok=True)
 
         # Export Integration Runtimes
         self._export_component(
@@ -325,7 +449,7 @@ class JSONExporter(BaseExporter):
 
         # Create data folder
         data_dir = workspace_dir / "data"
-        data_dir.mkdir(exist_ok=True)
+        self._mkdir(data_dir, exist_ok=True)
 
         # Export Serverless Databases with hierarchical structure
         self._export_synapse_serverless_databases(data, data_dir, files_created)
@@ -343,7 +467,7 @@ class JSONExporter(BaseExporter):
             return
 
         serverless_databases_dir = data_dir / "serverless_databases"
-        serverless_databases_dir.mkdir(exist_ok=True)
+        self._mkdir(serverless_databases_dir, exist_ok=True)
 
         databases = (
             data["sql_pools"]
@@ -355,14 +479,14 @@ class JSONExporter(BaseExporter):
         for database in databases:
             db_name = database.get("name", "unknown")
             db_dir = serverless_databases_dir / "databases" / db_name
-            db_dir.mkdir(parents=True, exist_ok=True)
+            self._mkdir(db_dir, parents=True, exist_ok=True)
 
             # Export database info
             db_file = db_dir / f"{db_name}.json"
             db_info = {
                 key: value for key, value in database.items() if key != "schemas"
             }
-            with open(db_file, "w") as f:
+            with self._open(db_file, "w") as f:
                 json.dump(
                     {
                         "type": "serverless_database",
@@ -378,12 +502,12 @@ class JSONExporter(BaseExporter):
             # Export schemas
             if "schemas" in database and "schemas" in database["schemas"]:
                 schemas_dir = db_dir / "schemas"
-                schemas_dir.mkdir(exist_ok=True)
+                self._mkdir(schemas_dir, exist_ok=True)
 
                 for schema in database["schemas"]["schemas"]:
                     schema_name = schema.get("name", "unknown")
                     schema_dir = schemas_dir / schema_name
-                    schema_dir.mkdir(exist_ok=True)
+                    self._mkdir(schema_dir, exist_ok=True)
 
                     # Export schema info
                     schema_file = schema_dir / f"{schema_name}.json"
@@ -392,7 +516,7 @@ class JSONExporter(BaseExporter):
                         for key, value in schema.items()
                         if key not in ["tables", "views"]
                     }
-                    with open(schema_file, "w") as f:
+                    with self._open(schema_file, "w") as f:
                         json.dump(
                             {
                                 "type": "schema",
@@ -408,12 +532,12 @@ class JSONExporter(BaseExporter):
                     # Export tables
                     if "tables" in schema and "tables" in schema["tables"]:
                         tables_dir = schema_dir / "tables"
-                        tables_dir.mkdir(exist_ok=True)
+                        self._mkdir(tables_dir, exist_ok=True)
 
                         for table in schema["tables"]["tables"]:
                             table_name = table.get("name", "unknown")
                             table_file = tables_dir / f"{table_name}.json"
-                            with open(table_file, "w") as f:
+                            with self._open(table_file, "w") as f:
                                 json.dump(
                                     {
                                         "type": "table",
@@ -429,12 +553,12 @@ class JSONExporter(BaseExporter):
                     # Export views
                     if "views" in schema and "views" in schema["views"]:
                         views_dir = schema_dir / "views"
-                        views_dir.mkdir(exist_ok=True)
+                        self._mkdir(views_dir, exist_ok=True)
 
                         for view in schema["views"]["views"]:
                             view_name = view.get("name", "unknown")
                             view_file = views_dir / f"{view_name}.json"
-                            with open(view_file, "w") as f:
+                            with self._open(view_file, "w") as f:
                                 json.dump(
                                     {
                                         "type": "view",
@@ -455,7 +579,7 @@ class JSONExporter(BaseExporter):
             return
 
         dedicated_databases_dir = data_dir / "dedicated_databases"
-        dedicated_databases_dir.mkdir(exist_ok=True)
+        self._mkdir(dedicated_databases_dir, exist_ok=True)
 
         # Process dedicated pools which contain databases
         for pool in data["sql_pools"].get("dedicated_pools", []):
@@ -464,7 +588,7 @@ class JSONExporter(BaseExporter):
                 database = pool["database"]
                 db_name = database.get("name", "unknown")
                 db_dir = dedicated_databases_dir / "databases" / db_name
-                db_dir.mkdir(parents=True, exist_ok=True)
+                self._mkdir(db_dir, parents=True, exist_ok=True)
 
                 # Export database info
                 db_file = db_dir / f"{db_name}.json"
@@ -472,7 +596,7 @@ class JSONExporter(BaseExporter):
                     key: value for key, value in database.items() if key != "schemas"
                 }
                 db_info["pool_name"] = pool_name  # Add reference to the pool
-                with open(db_file, "w") as f:
+                with self._open(db_file, "w") as f:
                     json.dump(
                         {
                             "type": "dedicated_database",
@@ -488,12 +612,12 @@ class JSONExporter(BaseExporter):
                 # Export schemas
                 if "schemas" in database and "schemas" in database["schemas"]:
                     schemas_dir = db_dir / "schemas"
-                    schemas_dir.mkdir(exist_ok=True)
+                    self._mkdir(schemas_dir, exist_ok=True)
 
                     for schema in database["schemas"]["schemas"]:
                         schema_name = schema.get("name", "unknown")
                         schema_dir = schemas_dir / schema_name
-                        schema_dir.mkdir(exist_ok=True)
+                        self._mkdir(schema_dir, exist_ok=True)
 
                         # Export schema info
                         schema_file = schema_dir / f"{schema_name}.json"
@@ -502,7 +626,7 @@ class JSONExporter(BaseExporter):
                             for key, value in schema.items()
                             if key not in ["tables", "views"]
                         }
-                        with open(schema_file, "w") as f:
+                        with self._open(schema_file, "w") as f:
                             json.dump(
                                 {
                                     "type": "schema",
@@ -518,12 +642,12 @@ class JSONExporter(BaseExporter):
                         # Export tables
                         if "tables" in schema and "tables" in schema["tables"]:
                             tables_dir = schema_dir / "tables"
-                            tables_dir.mkdir(exist_ok=True)
+                            self._mkdir(tables_dir, exist_ok=True)
 
                             for table in schema["tables"]["tables"]:
                                 table_name = table.get("name", "unknown")
                                 table_file = tables_dir / f"{table_name}.json"
-                                with open(table_file, "w") as f:
+                                with self._open(table_file, "w") as f:
                                     json.dump(
                                         {
                                             "type": "table",
@@ -539,12 +663,12 @@ class JSONExporter(BaseExporter):
                         # Export views
                         if "views" in schema and "views" in schema["views"]:
                             views_dir = schema_dir / "views"
-                            views_dir.mkdir(exist_ok=True)
+                            self._mkdir(views_dir, exist_ok=True)
 
                             for view in schema["views"]["views"]:
                                 view_name = view.get("name", "unknown")
                                 view_file = views_dir / f"{view_name}.json"
-                                with open(view_file, "w") as f:
+                                with self._open(view_file, "w") as f:
                                     json.dump(
                                         {
                                             "type": "view",
@@ -581,18 +705,16 @@ class JSONExporter(BaseExporter):
 
         # Create resources folder
         resources_dir = workspace_dir / "resources"
-        resources_dir.mkdir(exist_ok=True)
+        self._mkdir(resources_dir, exist_ok=True)
 
         # Helper: should this resource be exported?
         _should_export = (lambda r: r in resources) if resources else (lambda r: True)
 
         # Helper: clear a resource folder before rewriting
         def _clear_folder(folder: Path):
-            if folder.exists():
-                import shutil
-
-                shutil.rmtree(folder)
-            folder.mkdir(exist_ok=True)
+            if self._exists(folder):
+                self._remove_tree(folder)
+            self._mkdir(folder, exist_ok=True)
 
         # Export clusters
         if "clusters" in data and _should_export("clusters"):
@@ -601,7 +723,7 @@ class JSONExporter(BaseExporter):
 
             for cluster in data["clusters"].get("clusters", []):
                 cluster_file = clusters_dir / f"cluster_{cluster['cluster_name']}.json"
-                with open(cluster_file, "w") as f:
+                with self._open(cluster_file, "w") as f:
                     json.dump(
                         {
                             "type": "databricks_cluster",
@@ -621,7 +743,7 @@ class JSONExporter(BaseExporter):
 
             for job in data["jobs"].get("jobs", []):
                 job_file = jobs_dir / f"job_{job['job_id']}.json"
-                with open(job_file, "w") as f:
+                with self._open(job_file, "w") as f:
                     json.dump(
                         {
                             "type": "databricks_job",
@@ -636,7 +758,7 @@ class JSONExporter(BaseExporter):
 
         # Create data folder and export hierarchical structure
         data_dir = workspace_dir / "data"
-        data_dir.mkdir(exist_ok=True)
+        self._mkdir(data_dir, exist_ok=True)
 
         # Export legacy databases (non-Unity Catalog)
         self._export_databricks_legacy_databases(data, data_dir, files_created)
@@ -652,7 +774,7 @@ class JSONExporter(BaseExporter):
                 warehouse_name = wh.get("name") or warehouse_id
                 safe_name = self._safe_filename(f"{warehouse_name}_{warehouse_id}")
                 wh_file = sql_wh_dir / f"warehouse_{safe_name}.json"
-                with open(wh_file, "w") as f:
+                with self._open(wh_file, "w") as f:
                     json.dump(
                         {
                             "type": "databricks_sql_warehouse",
@@ -676,7 +798,7 @@ class JSONExporter(BaseExporter):
                 notebook_file = (
                     notebooks_dir / f"{notebook.get('path').replace('/', '_')}.json"
                 )
-                with open(notebook_file, "w") as f:
+                with self._open(notebook_file, "w") as f:
                     json.dump(
                         {
                             "type": "notebook",
@@ -692,16 +814,16 @@ class JSONExporter(BaseExporter):
                 # Export notebook source content if available
                 if notebook.get("content"):
                     sources_dir = workspace_dir / "notebook_sources"
-                    sources_dir.mkdir(exist_ok=True)
+                    self._mkdir(sources_dir, exist_ok=True)
                     nb_path = notebook.get("path", f"notebook_{i}")
                     # Preserve folder structure under notebook_sources/
                     source_file = sources_dir / nb_path.lstrip("/")
-                    source_file.parent.mkdir(parents=True, exist_ok=True)
+                    self._mkdir(source_file.parent, parents=True, exist_ok=True)
                     try:
                         import base64
 
                         decoded = base64.b64decode(notebook["content"]).decode("utf-8")
-                        with open(source_file, "w", encoding="utf-8") as f:
+                        with self._open(source_file, "w", encoding="utf-8") as f:
                             f.write(decoded)
                         files_created.append(str(source_file))
                     except Exception:
@@ -721,7 +843,7 @@ class JSONExporter(BaseExporter):
                     else pipeline_id
                 )
                 pipeline_file = pipelines_dir / f"pipeline_{safe_name}.json"
-                with open(pipeline_file, "w") as f:
+                with self._open(pipeline_file, "w") as f:
                     json.dump(
                         {
                             "type": "databricks_pipeline",
@@ -744,7 +866,7 @@ class JSONExporter(BaseExporter):
                     repo.get("repo_id") or repo.get("path") or "unknown"
                 )
                 repo_file = repos_dir / f"repo_{safe_name}.json"
-                with open(repo_file, "w") as f:
+                with self._open(repo_file, "w") as f:
                     json.dump(
                         {
                             "type": "databricks_repo",
@@ -767,7 +889,7 @@ class JSONExporter(BaseExporter):
                     experiment.get("experiment_id", "unknown")
                 )
                 exp_file = experiments_dir / f"experiment_{safe_name}.json"
-                with open(exp_file, "w") as f:
+                with self._open(exp_file, "w") as f:
                     json.dump(
                         {
                             "type": "databricks_experiment",
@@ -788,7 +910,7 @@ class JSONExporter(BaseExporter):
             for endpoint in data["serving_endpoints"].get("serving_endpoints", []):
                 safe_name = self._safe_filename(endpoint.get("name", "unknown"))
                 ep_file = endpoints_dir / f"endpoint_{safe_name}.json"
-                with open(ep_file, "w") as f:
+                with self._open(ep_file, "w") as f:
                     json.dump(
                         {
                             "type": "databricks_serving_endpoint",
@@ -809,7 +931,7 @@ class JSONExporter(BaseExporter):
             for alert in data["alerts"].get("alerts", []):
                 safe_name = self._safe_filename(alert.get("alert_id", "unknown"))
                 alert_file = alerts_dir / f"alert_{safe_name}.json"
-                with open(alert_file, "w") as f:
+                with self._open(alert_file, "w") as f:
                     json.dump(
                         {
                             "type": "databricks_alert",
@@ -830,7 +952,7 @@ class JSONExporter(BaseExporter):
             for space in data["genie_spaces"].get("genie_spaces", []):
                 safe_name = self._safe_filename(space.get("space_id", "unknown"))
                 space_file = genie_dir / f"space_{safe_name}.json"
-                with open(space_file, "w") as f:
+                with self._open(space_file, "w") as f:
                     json.dump(
                         {
                             "type": "databricks_genie_space",
@@ -853,7 +975,7 @@ class JSONExporter(BaseExporter):
                     policy.get("name") or policy.get("policy_id", "unknown")
                 )
                 policy_file = policies_dir / f"policy_{safe_name}.json"
-                with open(policy_file, "w") as f:
+                with self._open(policy_file, "w") as f:
                     json.dump(
                         {
                             "type": "databricks_cluster_policy",
@@ -877,7 +999,7 @@ class JSONExporter(BaseExporter):
                     or pool.get("instance_pool_id", "unknown")
                 )
                 pool_file = pools_dir / f"pool_{safe_name}.json"
-                with open(pool_file, "w") as f:
+                with self._open(pool_file, "w") as f:
                     json.dump(
                         {
                             "type": "databricks_instance_pool",
@@ -898,7 +1020,7 @@ class JSONExporter(BaseExporter):
             for ext in data["external_locations"].get("external_locations", []):
                 safe_name = self._safe_filename(ext.get("name", "unknown"))
                 ext_file = ext_dir / f"external_location_{safe_name}.json"
-                with open(ext_file, "w") as f:
+                with self._open(ext_file, "w") as f:
                     json.dump(
                         {
                             "type": "databricks_external_location",
@@ -919,7 +1041,7 @@ class JSONExporter(BaseExporter):
             for conn in data["connections"].get("connections", []):
                 safe_name = self._safe_filename(conn.get("name", "unknown"))
                 conn_file = conn_dir / f"connection_{safe_name}.json"
-                with open(conn_file, "w") as f:
+                with self._open(conn_file, "w") as f:
                     json.dump(
                         {
                             "type": "databricks_connection",
@@ -940,7 +1062,7 @@ class JSONExporter(BaseExporter):
             for scope in data["secret_scopes"].get("secret_scopes", []):
                 safe_name = self._safe_filename(scope.get("name", "unknown"))
                 scope_file = scope_dir / f"secret_scope_{safe_name}.json"
-                with open(scope_file, "w") as f:
+                with self._open(scope_file, "w") as f:
                     json.dump(
                         {
                             "type": "databricks_secret_scope",
@@ -963,16 +1085,16 @@ class JSONExporter(BaseExporter):
             return
 
         legacy_databases_dir = data_dir / "legacy_databases"
-        legacy_databases_dir.mkdir(exist_ok=True)
+        self._mkdir(legacy_databases_dir, exist_ok=True)
 
         for database in data["databases"].get("databases", []):
             db_name = database.get("name", "unknown")
             db_dir = legacy_databases_dir / "databases" / db_name
-            db_dir.mkdir(parents=True, exist_ok=True)
+            self._mkdir(db_dir, parents=True, exist_ok=True)
 
             # Export database info
             db_file = db_dir / f"{db_name}.json"
-            with open(db_file, "w") as f:
+            with self._open(db_file, "w") as f:
                 json.dump(
                     {
                         "type": "legacy_database",
@@ -993,7 +1115,7 @@ class JSONExporter(BaseExporter):
             return
 
         unity_catalog_dir = data_dir / "unity_catalog"
-        unity_catalog_dir.mkdir(exist_ok=True)
+        self._mkdir(unity_catalog_dir, exist_ok=True)
 
         for catalog in data["catalogs"].get("catalogs", []):
             catalog_name = catalog.get("name", "unknown")
@@ -1005,14 +1127,14 @@ class JSONExporter(BaseExporter):
             )
 
             catalog_dir = unity_catalog_dir / "catalogs" / safe_catalog_name
-            catalog_dir.mkdir(parents=True, exist_ok=True)
+            self._mkdir(catalog_dir, parents=True, exist_ok=True)
 
             # Export catalog info
             catalog_file = catalog_dir / f"{safe_catalog_name}.json"
             catalog_info = {
                 key: value for key, value in catalog.items() if key != "schemas"
             }
-            with open(catalog_file, "w") as f:
+            with self._open(catalog_file, "w") as f:
                 json.dump(
                     {
                         "type": "unity_catalog",
@@ -1028,12 +1150,12 @@ class JSONExporter(BaseExporter):
             # Export schemas
             if "schemas" in catalog and "schemas" in catalog["schemas"]:
                 schemas_dir = catalog_dir / "schemas"
-                schemas_dir.mkdir(exist_ok=True)
+                self._mkdir(schemas_dir, exist_ok=True)
 
                 for schema in catalog["schemas"]["schemas"]:
                     schema_name = schema.get("name", "unknown")
                     schema_dir = schemas_dir / schema_name
-                    schema_dir.mkdir(exist_ok=True)
+                    self._mkdir(schema_dir, exist_ok=True)
 
                     # Export schema info
                     schema_file = schema_dir / f"{schema_name}.json"
@@ -1042,7 +1164,7 @@ class JSONExporter(BaseExporter):
                         for key, value in schema.items()
                         if key not in ["tables", "volumes", "functions"]
                     }
-                    with open(schema_file, "w") as f:
+                    with self._open(schema_file, "w") as f:
                         json.dump(
                             {
                                 "type": "schema",
@@ -1058,12 +1180,12 @@ class JSONExporter(BaseExporter):
                     # Export tables
                     if "tables" in schema:
                         tables_dir = schema_dir / "tables"
-                        tables_dir.mkdir(exist_ok=True)
+                        self._mkdir(tables_dir, exist_ok=True)
 
                         for table in schema["tables"]:
                             table_name = table.get("name", "unknown")
                             table_file = tables_dir / f"{table_name}.json"
-                            with open(table_file, "w") as f:
+                            with self._open(table_file, "w") as f:
                                 json.dump(
                                     {
                                         "type": "table",
@@ -1079,12 +1201,12 @@ class JSONExporter(BaseExporter):
                     # Export volumes
                     if "volumes" in schema:
                         volumes_dir = schema_dir / "volumes"
-                        volumes_dir.mkdir(exist_ok=True)
+                        self._mkdir(volumes_dir, exist_ok=True)
 
                         for volume in schema["volumes"]:
                             volume_name = volume.get("name", "unknown")
                             volume_file = volumes_dir / f"{volume_name}.json"
-                            with open(volume_file, "w") as f:
+                            with self._open(volume_file, "w") as f:
                                 json.dump(
                                     {
                                         "type": "volume",
@@ -1100,12 +1222,12 @@ class JSONExporter(BaseExporter):
                     # Export functions
                     if "functions" in schema:
                         functions_dir = schema_dir / "functions"
-                        functions_dir.mkdir(exist_ok=True)
+                        self._mkdir(functions_dir, exist_ok=True)
 
                         for function in schema["functions"]:
                             function_name = function.get("name", "unknown")
                             function_file = functions_dir / f"{function_name}.json"
-                            with open(function_file, "w") as f:
+                            with self._open(function_file, "w") as f:
                                 json.dump(
                                     {
                                         "type": "function",
@@ -1127,10 +1249,19 @@ class CSVExporter(BaseExporter):
         assessment_data: Union[SynapseAssessment, DatabricksAssessment],
         output_path: str,
         workspace_name: str,
+        *,
+        output_adapter: Optional[OutputPathAdapter] = None,
+        legacy_path_limit: bool = False,
     ) -> Dict[str, Any]:
         """Export assessment data as CSV files (scaffolding)."""
+        adapter = output_adapter or OutputPathAdapter(output_path)
         workspace_dir = Path(output_path) / workspace_name
-        workspace_dir.mkdir(parents=True, exist_ok=True)
+        path_error = format_path_error(
+            workspace_name, adapter, [], [workspace_dir], legacy_limit=legacy_path_limit
+        )
+        if path_error:
+            raise path_error
+        adapter.mkdir(workspace_dir, parents=True, exist_ok=True)
 
         # TODO: Implement CSV export
         # This would create CSV files for:
@@ -1158,10 +1289,19 @@ class ParquetExporter(BaseExporter):
         assessment_data: Union[SynapseAssessment, DatabricksAssessment],
         output_path: str,
         workspace_name: str,
+        *,
+        output_adapter: Optional[OutputPathAdapter] = None,
+        legacy_path_limit: bool = False,
     ) -> Dict[str, Any]:
         """Export assessment data as Parquet files (scaffolding)."""
+        adapter = output_adapter or OutputPathAdapter(output_path)
         workspace_dir = Path(output_path) / workspace_name
-        workspace_dir.mkdir(parents=True, exist_ok=True)
+        path_error = format_path_error(
+            workspace_name, adapter, [], [workspace_dir], legacy_limit=legacy_path_limit
+        )
+        if path_error:
+            raise path_error
+        adapter.mkdir(workspace_dir, parents=True, exist_ok=True)
 
         # TODO: Implement Parquet export
         # This would create Parquet files for:
@@ -1200,6 +1340,8 @@ class StructuredExportService:
         output_path: str,
         format: str = "json",
         resources: Optional[List[str]] = None,
+        output_adapter: Optional[OutputPathAdapter] = None,
+        legacy_path_limit: bool = False,
     ) -> Dict[str, Any]:
         """
         Export assessment data in specified format.
@@ -1225,9 +1367,23 @@ class StructuredExportService:
         utils_ui.print_extracting(
             f"Exporting {workspace_name} assessment data in {format} format"
         )
-        result = exporter.export(
-            assessment_data, output_path, workspace_name, resources=resources
-        )
+        if format == "json":
+            result = exporter.export(
+                assessment_data,
+                output_path,
+                workspace_name,
+                resources=resources,
+                output_adapter=output_adapter,
+                legacy_path_limit=legacy_path_limit,
+            )
+        else:
+            result = exporter.export(
+                assessment_data,
+                output_path,
+                workspace_name,
+                output_adapter=output_adapter,
+                legacy_path_limit=legacy_path_limit,
+            )
         utils_ui.print_extraction_done(
             f"Exporting {workspace_name} assessment data in {format} format"
         )

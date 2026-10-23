@@ -26,10 +26,10 @@ This tool allows to scan one or multiple workspaces in order to get all the info
 
 ## Installation
 
-You can use the [prebuilt wheel file](./resources/fabric_assessment_tool-0.3.0-py3-none-any.whl) in the resources folder.
+You can use the [prebuilt wheel file](./resources/fabric_assessment_tool-0.3.1-py3-none-any.whl) in the resources folder.
 
 ```bash
-pip install resources/fabric_assessment_tool-0.3.0-py3-none-any.whl
+pip install resources/fabric_assessment_tool-0.3.1-py3-none-any.whl
 ```
 
 ## Authentication
@@ -161,6 +161,7 @@ fat assess --source <synapse|databricks> \
           --mode <full> \
           --ws <workspace1_name,workspace2_name> \
           [--resources <resource1,resource2>] \
+          [--windows-long-paths] \
           -o/--output <output_path>
 ```
 
@@ -190,6 +191,27 @@ fat assess --source <synapse|databricks> \
 - `--sql-tenant-id`: Azure tenant ID (optional, defaults to 'common')
 - `--resources`: Comma-separated list of resource types to extract. When omitted, all resources are extracted. Use this to re-extract only specific resources without repeating a full assessment. Previously exported data for other resources is preserved and summaries are recalculated accurately.
   - Valid Databricks resources: `clusters`, `sql_warehouses`, `notebooks`, `jobs`, `catalogs`, `external_locations`, `connections`, `secret_scopes`, `pipelines`, `repos`, `experiments`, `serving_endpoints`, `alerts`, `genie_spaces`, `cluster_policies`, `instance_pools`
+- `--windows-long-paths`: Windows-only. Use normalized absolute Windows extended-length paths (`\\?\`, including UNC paths) for output. FAT probes the destination before collection and does not change registry or system policy. On a non-Windows system, omit this option.
+
+#### Windows output paths
+
+On Windows, FAT probes the selected destination before authentication or collection. If this FAT process is subject to legacy path limits, FAT warns immediately and checks the complete planned workspace export after collection but before writing or clearing any workspace output. A path failure preserves that workspace's existing export. In an interactive terminal, FAT offers to retry the already-collected workspace data using extended-length paths; accepting triggers a fresh destination probe and complete preflight. No data is recollected, and FAT does not provide checkpoint/resume.
+
+Prefer a short absolute output root when possible:
+
+```powershell
+fat assess --source synapse --ws my-workspace -o C:\FAT
+```
+
+Or explicitly request extended-length paths:
+
+```powershell
+fat assess --source synapse --ws my-workspace -o .\assessment --windows-long-paths
+```
+
+Relative output paths are resolved to normalized absolute paths before the `\\?\` prefix is applied. UNC output uses the `\\?\UNC\server\share\...` form. This option does not enable Windows long-path policy or modify registry settings. Windows long-path configuration requires compatible system policy and a compatible Python runtime; restart FAT after changing that configuration so capability detection runs again. Extended paths still have component and total-length limits, and Windows Explorer or external tools may not consume long-path output correctly. On WSL, prefer a path in the Linux filesystem rather than assuming a Windows-mounted path avoids Windows limits. Running FAT on Linux, macOS, or a suitable Unix filesystem is another alternative.
+
+Windows path handling details: [Maximum Path Length Limitation](https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation).
 
 **Examples:**
 ```bash

@@ -60,6 +60,7 @@ from ..assessment.databricks import (
     DatabricksWorkspaceInfo,
     DatabricksNetworkSettings,
 )
+from ..utils.output_paths import OutputPathAdapter
 from ..utils import ui as utils_ui
 from .api_client import ApiClient, ApiResponse
 from .token_provider import TokenProvider, create_token_provider
@@ -399,6 +400,7 @@ class DatabricksClient:
         resources: Optional[List[str]] = None,
         output_path: Optional[str] = None,
         download_notebooks: bool = False,
+        output_adapter: Optional[OutputPathAdapter] = None,
     ) -> DatabricksAssessment:
         """
         Assess a Databricks workspace.
@@ -445,7 +447,7 @@ class DatabricksClient:
             disk_data = {}
             if resources and output_path:
                 disk_data = self._load_resources_from_disk(
-                    workspace_name, output_path, resources
+                    workspace_name, output_path, resources, output_adapter
                 )
 
             # Get clusters
@@ -653,6 +655,7 @@ class DatabricksClient:
         workspace_name: str,
         output_path: str,
         resources_to_extract: List[str],
+        output_adapter: Optional[OutputPathAdapter] = None,
     ) -> Dict[str, Any]:
         """Load previously exported resources from disk.
 
@@ -668,7 +671,8 @@ class DatabricksClient:
         Returns:
             Dict mapping resource type name to its collection dataclass
         """
-        workspace_dir = Path(output_path) / workspace_name / "resources"
+        adapter = output_adapter or OutputPathAdapter(output_path)
+        workspace_dir = adapter.root / workspace_name / "resources"
         loaded: Dict[str, Any] = {}
 
         # Mapping from resource name to (folder name, item class, collection class, collection field)
@@ -750,13 +754,13 @@ class DatabricksClient:
                 continue  # Will be freshly extracted
 
             folder_path = workspace_dir / folder
-            if not folder_path.exists():
+            if not adapter.exists(folder_path):
                 continue
 
             items = []
-            for json_file in sorted(folder_path.glob("*.json")):
+            for json_file in sorted(adapter.glob(folder_path, "*.json")):
                 try:
-                    with open(json_file, "r", encoding="utf-8") as f:
+                    with adapter.open(json_file, "r", encoding="utf-8") as f:
                         data = json.load(f)
                     # Extract the inner data (wrapped format)
                     inner = (

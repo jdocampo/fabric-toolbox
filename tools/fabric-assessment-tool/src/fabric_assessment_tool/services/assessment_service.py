@@ -1,7 +1,8 @@
 import json
 import os
-from dataclasses import asdict
+import sys
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fabric_assessment_tool.clients.databricks_client import DatabricksClient
@@ -9,6 +10,18 @@ from fabric_assessment_tool.clients.synapse_client import SynapseClient
 
 from ..utils import ui as utils_ui
 from .structured_export_service import DecimalEncoder, StructuredExportService
+from ..utils.output_paths import (
+    ExportPathLengthError,
+    OutputPathAdapter,
+    OutputPathCapabilityError,
+)
+
+
+class AssessmentStageError(RuntimeError):
+    def __init__(self, message: str, stage: str, error_code: str) -> None:
+        super().__init__(message)
+        self.stage = stage
+        self.error_code = error_code
 
 
 class AssessmentService:
@@ -36,6 +49,7 @@ class AssessmentService:
         sql_tenant_id: Optional[str] = None,
         resources: Optional[List[str]] = None,
         download_notebooks: bool = False,
+        windows_long_paths: bool = False,
     ) -> Dict[str, Any]:
         """
         Perform assessment on specified workspaces.
@@ -63,6 +77,11 @@ class AssessmentService:
         Returns:
             Assessment results dictionary
         """
+        output_adapter, legacy_path_limit = self._prepare_output_path(
+            output_path, windows_long_paths
+        )
+        output_path = str(output_adapter.root)
+
         # print(f"Initializing {source} client...")
 
         if source == "synapse" and cloud != "azure":
@@ -87,7 +106,7 @@ class AssessmentService:
             )
 
         # Get or create client for the source
-        client_kwargs = {}
+        client_kwargs: Dict[str, Any] = {}
         if source == "databricks":
             client_kwargs["cloud"] = cloud
         if subscription_id:
@@ -110,14 +129,14 @@ class AssessmentService:
         client = self._get_client(source=source, **client_kwargs)
 
         # Perform assessment
-        assessment_results = {
+        assessment_results: Dict[str, Any] = {
             "metadata": {
                 "source": source,
                 "mode": mode,
                 "cloud": cloud,
                 "workspaces": workspaces,
                 "timestamp": datetime.now().isoformat(),
-                "version": "0.3.0",
+                "version": "0.3.1",
                 "output_format": output_format,
             },
             "results": [],
@@ -129,7 +148,7 @@ class AssessmentService:
             },
         }
 
-        export_results = {"results": []}
+        export_results: Dict[str, Any] = {"results": []}
 
         if not workspaces or len(workspaces) == 0:
             # Get all workspaces from the client and let the client choose which ones to assess
@@ -148,15 +167,21 @@ class AssessmentService:
         # Assess each workspace
         for workspace in workspaces:
             # print(f"Assessing workspace: {workspace}")
+            workspace_assessment = None
+            export_resources = resources
             try:
                 # Get assessment data as dataclass object
-                workspace_assessment = client.assess_workspace(
-                    workspace,
-                    mode,
-                    resources=resources,
-                    output_path=output_path,
-                    download_notebooks=download_notebooks,
-                )
+                if source == "databricks":
+                    workspace_assessment = client.assess_workspace(
+                        workspace,
+                        mode,
+                        resources=resources,
+                        output_path=output_path,
+                        download_notebooks=download_notebooks,
+                        output_adapter=output_adapter,
+                    )
+                else:
+                    workspace_assessment = client.assess_workspace(workspace, mode)
 
                 # Export the assessment data using the structured export service
                 # When jobs are re-extracted, notebooks are re-annotated with
@@ -165,12 +190,14 @@ class AssessmentService:
                 if resources and "jobs" in resources and "notebooks" not in resources:
                     export_resources = list(resources) + ["notebooks"]
 
-                export_result = self.export_service.export_assessment(
-                    assessment_data=workspace_assessment,
-                    workspace_name=workspace,
-                    output_path=output_path,
-                    format=output_format,
-                    resources=export_resources,
+                export_result = self._export_workspace(
+                    workspace_assessment,
+                    workspace,
+                    output_path,
+                    output_format,
+                    export_resources,
+                    output_adapter,
+                    legacy_path_limit,
                 )
 
                 export_results["results"].append(export_result)
@@ -202,16 +229,80 @@ class AssessmentService:
                 # This is redundant now, as export info is included in each result
                 # assessment_results["export_results"].append(export_result)
 
+            except ExportPathLengthError as e:
+                utils_ui.print_error(str(e))
+                retried_export_result = None
+                retry_error = None
+                if workspace_assessment is not None:
+                    retried_export_result, retry_error = (
+                        self._retry_with_extended_paths(
+                            e,
+                            workspace_assessment,
+                            workspace,
+                            output_path,
+                            output_format,
+                            export_resources,
+                        )
+                    )
+                if retried_export_result is not None:
+                    assert workspace_assessment is not None
+                    export_results["results"].append(retried_export_result)
+                    assessment_status = workspace_assessment.status.status
+                    result_status = (
+                        "success" if assessment_status == "completed" else "incomplete"
+                    )
+                    result_entry = {
+                        "workspace": workspace,
+                        "status": result_status,
+                        "summary": workspace_assessment.get_summary(),
+                    }
+                    if assessment_status == "incomplete":
+                        result_entry["assessment_status"] = {
+                            "status": assessment_status,
+                            "description": workspace_assessment.status.description,
+                        }
+                        assessment_results["summary"]["incomplete_workspaces"] += 1
+                    else:
+                        assessment_results["summary"]["assessed_workspaces"] += 1
+                    assessment_results["results"].append(result_entry)
+                    continue
+                if retry_error is not None:
+                    utils_ui.print_error(
+                        f"Extended-path retry failed for workspace {workspace}: {retry_error}"
+                    )
+                    failure = retry_error
+                else:
+                    failure = e
+                assessment_results["results"].append(
+                    {
+                        "workspace": workspace,
+                        "status": "failed",
+                        "stage": getattr(failure, "stage", e.stage),
+                        "error_code": getattr(failure, "error_code", e.error_code),
+                        "error": str(failure),
+                    }
+                )
+                assessment_results["summary"]["failed_workspaces"] += 1
             except Exception as e:
                 utils_ui.print_error(f"Failed to assess workspace {workspace}: {e}")
                 assessment_results["results"].append(
-                    {"workspace": workspace, "status": "failed", "error": str(e)}
+                    {
+                        "workspace": workspace,
+                        "status": "failed",
+                        "stage": getattr(e, "stage", "assessment"),
+                        "error_code": getattr(e, "error_code", None),
+                        "error": str(e),
+                    }
                 )
                 assessment_results["summary"]["failed_workspaces"] += 1
 
         # Save overall assessment summary
-        summary_file = self._save_assessment_summary(assessment_results, output_path)
-        export_summary_file = self._save_export_results(export_results, output_path)
+        summary_file = self._save_assessment_summary(
+            assessment_results, output_path, output_adapter
+        )
+        export_summary_file = self._save_export_results(
+            export_results, output_path, output_adapter
+        )
 
         utils_ui.print("")
         utils_ui.print(f"Assessment summary saved to: {summary_file}")
@@ -219,6 +310,137 @@ class AssessmentService:
         utils_ui.print(f"Individual workspace details saved in: {output_path}")
 
         return assessment_results
+
+    def _prepare_output_path(
+        self, output_path: str, windows_long_paths: bool
+    ) -> tuple[OutputPathAdapter, bool]:
+        adapter = OutputPathAdapter(output_path, windows_long_paths=windows_long_paths)
+        if windows_long_paths and not adapter.is_windows:
+            raise ValueError(
+                "--windows-long-paths is Windows-only; omit this option on non-Windows systems."
+            )
+
+        legacy_path_limit = False
+        if adapter.is_windows:
+            try:
+                capability = adapter.probe_long_paths()
+            except OutputPathCapabilityError as probe_error:
+                probe_error.stage = "path_capability_probe"
+                probe_error.error_code = "WINDOWS_PATH_CAPABILITY_FAILED"
+                raise
+            except OSError as probe_error:
+                raise OutputPathCapabilityError(
+                    f"Could not probe Windows output-path capability beneath "
+                    f"{adapter.root}: {probe_error}"
+                ) from probe_error
+            if windows_long_paths and capability != "supported":
+                mode_error = OutputPathCapabilityError(
+                    "The destination could not create, read, and remove an extended-length "
+                    "probe path. FAT will not collect data or silently fall back to ordinary paths."
+                )
+                mode_error.stage = "path_capability_probe"
+                mode_error.error_code = "WINDOWS_LONG_PATHS_UNAVAILABLE"
+                raise mode_error
+            legacy_path_limit = not windows_long_paths and capability == "legacy"
+            if legacy_path_limit:
+                utils_ui.print_warning(
+                    "Windows legacy path limits apply to this FAT process.\n"
+                    "FAT will validate all export paths after collection and before writing "
+                    "assessment output. A short absolute output directory is recommended, "
+                    "for example: -o C:\\FAT\n"
+                    "Alternatively, rerun with --windows-long-paths to use extended-length "
+                    "absolute Windows paths."
+                )
+
+        summary_files = [
+            adapter.root / "assessment_summary.json",
+            adapter.root / "export_results_summary.json",
+        ]
+        violations = adapter.validate(
+            summary_files, [adapter.root], legacy_limit=legacy_path_limit
+        )
+        if violations:
+            legacy_failure = legacy_path_limit and any(
+                violation.kind in ("file path", "directory creation path")
+                for violation in violations
+            )
+            raise ExportPathLengthError(
+                "invocation", violations, legacy_limit=legacy_failure
+            )
+        return adapter, legacy_path_limit
+
+    def _export_workspace(
+        self,
+        assessment_data: Any,
+        workspace_name: str,
+        output_path: str,
+        output_format: str,
+        resources: Optional[List[str]],
+        output_adapter: OutputPathAdapter,
+        legacy_path_limit: bool,
+    ) -> Dict[str, Any]:
+        return self.export_service.export_assessment(
+            assessment_data=assessment_data,
+            workspace_name=workspace_name,
+            output_path=output_path,
+            format=output_format,
+            resources=resources,
+            output_adapter=output_adapter,
+            legacy_path_limit=legacy_path_limit,
+        )
+
+    def _retry_with_extended_paths(
+        self,
+        path_error: ExportPathLengthError,
+        assessment_data: Any,
+        workspace_name: str,
+        output_path: str,
+        output_format: str,
+        resources: Optional[List[str]],
+    ) -> tuple[Optional[Dict[str, Any]], Optional[Exception]]:
+        if not path_error.legacy_limit or not (
+            sys.stdin.isatty() and sys.stdout.isatty()
+        ):
+            return None, None
+
+        use_extended_paths = utils_ui.prompt_confirm(
+            f"Workspace {workspace_name} has already been collected. Retry its export "
+            "using Windows extended-length paths? This changes no Windows settings."
+        )
+        if use_extended_paths is not True:
+            return None, None
+
+        adapter = OutputPathAdapter(output_path, windows_long_paths=True)
+        try:
+            if adapter.probe_long_paths() != "supported":
+                raise OutputPathCapabilityError(
+                    "The destination's extended-length probe failed; no retry was attempted."
+                )
+            result = self._export_workspace(
+                assessment_data,
+                workspace_name,
+                output_path,
+                output_format,
+                resources,
+                adapter,
+                False,
+            )
+            return result, None
+        except (ExportPathLengthError, OutputPathCapabilityError) as error:
+            if isinstance(error, OutputPathCapabilityError):
+                error.stage = "path_capability_probe"
+                error.error_code = "WINDOWS_LONG_PATHS_UNAVAILABLE"
+            return None, error
+        except OSError as error:
+            capability_error = OutputPathCapabilityError(
+                f"Could not probe extended-length paths beneath {adapter.root}: {error}"
+            )
+            capability_error.error_code = "WINDOWS_LONG_PATHS_UNAVAILABLE"
+            return None, capability_error
+        except Exception as error:
+            return None, AssessmentStageError(
+                str(error), "export", "EXPORT_RETRY_FAILED"
+            )
 
     def _get_client(self, source: str, **kwargs) -> Any:
         """Get or create API client for the specified source."""
@@ -257,42 +479,52 @@ class AssessmentService:
             )
 
     def _save_assessment_summary(
-        self, results: Dict[str, Any], output_path: str
+        self,
+        results: Dict[str, Any],
+        output_path: str,
+        output_adapter: Optional[OutputPathAdapter] = None,
     ) -> str:
         """Save overall assessment summary to the output directory."""
-        # Create output directory if it doesn't exist
-        os.makedirs(output_path, exist_ok=True)
+        adapter = output_adapter or OutputPathAdapter(output_path)
+        adapter.mkdir(adapter.root, parents=True, exist_ok=True)
 
-        # Save the overall assessment summary
-        summary_file = os.path.join(output_path, "assessment_summary.json")
-        with open(summary_file, "w") as f:
+        summary_file = str(adapter.root / "assessment_summary.json")
+        with adapter.open(summary_file, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2, cls=DecimalEncoder)
 
         return summary_file
 
-    def _save_export_results(self, results: Dict[str, Any], output_path: str) -> str:
+    def _save_export_results(
+        self,
+        results: Dict[str, Any],
+        output_path: str,
+        output_adapter: Optional[OutputPathAdapter] = None,
+    ) -> str:
         """Save export results summary to the output directory."""
-        # Create output directory if it doesn't exist
-        os.makedirs(output_path, exist_ok=True)
+        adapter = output_adapter or OutputPathAdapter(output_path)
+        adapter.mkdir(adapter.root, parents=True, exist_ok=True)
 
-        # Save the export results summary
-        export_summary_file = os.path.join(output_path, "export_results_summary.json")
-        with open(export_summary_file, "w") as f:
+        export_summary_file = str(adapter.root / "export_results_summary.json")
+        with adapter.open(export_summary_file, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2, cls=DecimalEncoder)
 
         return export_summary_file
 
-    def _save_results(self, results: Dict[str, Any], output_path: str) -> None:
+    def _save_results(
+        self,
+        results: Dict[str, Any],
+        output_path: str,
+        output_adapter: Optional[OutputPathAdapter] = None,
+    ) -> None:
         """Legacy method for backward compatibility."""
+        adapter = output_adapter or OutputPathAdapter(output_path)
         # For backward compatibility, save as single file if output_path ends with .json
         if output_path.endswith(".json"):
-            os.makedirs(
-                os.path.dirname(output_path) if os.path.dirname(output_path) else ".",
-                exist_ok=True,
-            )
-            with open(output_path, "w") as f:
+            parent = Path(output_path).parent
+            adapter.mkdir(parent, parents=True, exist_ok=True)
+            with adapter.open(output_path, "w", encoding="utf-8") as f:
                 json.dump(results, f, indent=2, cls=DecimalEncoder)
             print(f"Assessment results saved to: {output_path}")
         else:
             # Use new structured approach
-            self._save_assessment_summary(results, output_path)
+            self._save_assessment_summary(results, output_path, adapter)

@@ -60,6 +60,16 @@ Examples:
         )
 
         parser.add_argument(
+            "--windows-long-paths",
+            action="store_true",
+            default=False,
+            help=(
+                "Use Windows extended-length absolute output paths (\\\\?\\), "
+                "including UNC paths. Does not modify Windows settings. Windows only."
+            ),
+        )
+
+        parser.add_argument(
             "--ws",
             "--workspace",
             default="",
@@ -184,9 +194,14 @@ Examples:
                 sql_tenant_id=getattr(args, "sql_tenant_id", None),
                 resources=resources,
                 download_notebooks=getattr(args, "download_notebooks", False),
+                windows_long_paths=getattr(args, "windows_long_paths", False),
             )
 
-            utils_ui.print(f"Assessment completed successfully!")
+            failed_workspaces = result.get("summary", {}).get("failed_workspaces", 0)
+            if failed_workspaces:
+                utils_ui.print("Assessment completed with workspace failures.")
+            else:
+                utils_ui.print("Assessment completed successfully!")
 
             # Show export information
             if result.get("export_results"):
@@ -227,6 +242,9 @@ Examples:
                         print(f"  {key}: {value} (completed with limited permissions)")
                     else:
                         print(f"  {key}: {value}")
+
+            if failed_workspaces:
+                raise SystemExit(1)
 
         except Exception as e:
             print(f"Assessment failed: {e}")

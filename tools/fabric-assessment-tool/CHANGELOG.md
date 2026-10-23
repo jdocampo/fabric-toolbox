@@ -5,6 +5,12 @@ All notable changes to the Fabric Assessment Tool will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-10-23
+
+### Added
+
+- **Windows Export Path Preflight**: Detect destination path capabilities, validate complete export paths before writing, and support `--windows-long-paths` with an interactive retry using collected assessment data.
+
 ## [0.3.0] - 2026-07-06
 
 ### Added
