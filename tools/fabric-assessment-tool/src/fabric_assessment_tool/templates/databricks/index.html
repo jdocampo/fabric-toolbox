@@ -142,7 +142,7 @@
                     {% for ws_name, ws in workspaces.items() %}
                     <tr data-workspace="{{ ws_name }}">
                         <td>
-                            <a href="{{ base_path }}workspaces/{{ ws_name }}.html">{{ ws_name }}</a>
+                            <a href="{{ base_path }}workspaces/{{ ws_name | filename_url_component }}.html">{{ ws_name }}</a>
                         </td>
                         <td>
                             {% set wtype = ws.summary.workspace_info.workspace_type | default('unknown', true) %}

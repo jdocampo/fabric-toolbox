@@ -5,8 +5,15 @@ import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 from jinja2 import Environment, PackageLoader, select_autoescape
+
+from ..utils.filenames import safe_filename_component
+
+
+def filename_url_component(name: object) -> str:
+    return quote(safe_filename_component(name), safe="-._~")
 
 
 class VisualizationService:
@@ -20,6 +27,7 @@ class VisualizationService:
         # Register custom filters
         self.env.filters["format_number"] = self._format_number
         self.env.filters["format_size"] = self._format_size
+        self.env.filters["filename_url_component"] = filename_url_component
 
     def generate_report(
         self,
@@ -277,7 +285,7 @@ class VisualizationService:
         self, input_dir: Path, workspace: Optional[str] = None
     ) -> Dict[str, Any]:
         """Load assessment data from JSON files in the input directory."""
-        data = {
+        data: Dict[str, Any] = {
             "workspaces": {},
             "platform": None,
             "generated_at": datetime.now().isoformat(),
@@ -286,14 +294,16 @@ class VisualizationService:
         # Find workspace directories (exclude 'reports' directory)
         for item in input_dir.iterdir():
             if item.is_dir() and item.name != "reports":
-                if workspace and item.name != workspace:
-                    continue
                 ws_data = self._load_workspace_data(item)
-                if ws_data:
-                    data["workspaces"][item.name] = ws_data
-                    # Detect platform from workspace data
-                    if data["platform"] is None:
-                        data["platform"] = ws_data.get("platform", "unknown")
+                if not ws_data:
+                    continue
+                workspace_name = ws_data["name"]
+                if workspace and workspace_name != workspace:
+                    continue
+                data["workspaces"][workspace_name] = ws_data
+                # Detect platform from workspace data
+                if data["platform"] is None:
+                    data["platform"] = ws_data.get("platform", "unknown")
 
         # Calculate aggregate statistics
         data["summary"] = self._calculate_summary(data["workspaces"])
@@ -312,8 +322,17 @@ class VisualizationService:
         except (json.JSONDecodeError, IOError):
             return None
 
+        workspace_info = summary.get("workspace_info")
+        summary_workspace_name = (
+            workspace_info.get("name") if isinstance(workspace_info, dict) else None
+        )
+        workspace_name = (
+            summary_workspace_name
+            or summary.get("workspace_name")
+            or workspace_dir.name
+        )
         ws_data = {
-            "name": workspace_dir.name,
+            "name": workspace_name,
             "summary": summary,
             "platform": self._detect_platform(summary),
             "resources": {},
@@ -540,7 +559,7 @@ class VisualizationService:
             base_path="../",
         )
 
-        output_file = ws_dir / f"{workspace_name}.html"
+        output_file = ws_dir / f"{safe_filename_component(workspace_name)}.html"
         with open(output_file, "w", encoding="utf-8") as f:
             f.write(html)
 

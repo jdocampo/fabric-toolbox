@@ -1,5 +1,6 @@
 import json
 import os
+import base64
 from dataclasses import dataclass
 from unittest.mock import patch
 
@@ -20,6 +21,7 @@ from fabric_assessment_tool.assessment.databricks import (
     DatabricksGenieSpaces,
     DatabricksInstancePools,
     DatabricksJobs,
+    DatabricksNotebook,
     DatabricksNotebooks,
     DatabricksPipelines,
     DatabricksRepos,
@@ -29,6 +31,7 @@ from fabric_assessment_tool.assessment.databricks import (
     DatabricksWorkspaceInfo,
 )
 from fabric_assessment_tool.services.structured_export_service import JSONExporter
+from fabric_assessment_tool.utils.filenames import safe_filename_component
 from fabric_assessment_tool.utils.output_paths import (
     ExportPathLengthError,
     OutputPathAdapter,
@@ -168,6 +171,97 @@ def test_json_export_executes_only_after_plan_and_preserves_layout(tmp_path):
         == "short-cluster"
     )
     assert str(cluster_file) in result["files_created"]
+
+
+def test_databricks_export_encodes_unsafe_workspace_and_notebook_names(tmp_path):
+    workspace_name = "workspace\nname:?"
+    notebook_path = "/../Group/script\nname:?.py"
+    assessment = make_databricks_assessment("cluster\nname")
+    assessment.notebooks.notebooks.append(
+        DatabricksNotebook(
+            path=notebook_path,
+            default_language="PYTHON",
+            embedded_languages=[],
+            other_magics=[],
+            json_response={},
+            content=base64.b64encode(b"print('safe')").decode("ascii"),
+        )
+    )
+
+    result = JSONExporter().export(
+        assessment,
+        str(tmp_path),
+        workspace_name,
+        output_adapter=OutputPathAdapter(str(tmp_path), is_windows=os.name == "nt"),
+        legacy_path_limit=os.name == "nt",
+    )
+
+    workspace_dir = tmp_path / safe_filename_component(workspace_name)
+    cluster_file = (
+        workspace_dir
+        / "resources"
+        / "clusters"
+        / f"cluster_{safe_filename_component('cluster\nname')}.json"
+    )
+    notebook_metadata = (
+        workspace_dir
+        / "resources"
+        / "notebooks"
+        / f"{safe_filename_component(notebook_path.replace('/', '_'))}.json"
+    )
+    notebook_source = (
+        workspace_dir
+        / "notebook_sources"
+        / "%2E%2E"
+        / "Group"
+        / "script%0Aname%3A%3F.py"
+    )
+
+    assert cluster_file.is_file()
+    metadata = json.loads(notebook_metadata.read_text(encoding="utf-8"))
+    assert metadata["notebook_data"]["path"] == notebook_path
+    assert notebook_source.read_text(encoding="utf-8") == "print('safe')"
+    assert notebook_source.resolve().is_relative_to(
+        (workspace_dir / "notebook_sources").resolve()
+    )
+    assert str(notebook_source) in result["files_created"]
+
+
+def test_synapse_export_encodes_unsafe_hierarchical_names(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "fabric_assessment_tool.services.structured_export_service.SynapseAssessment",
+        FakeSynapseAssessment,
+    )
+    workspace_name = "workspace\nname"
+    assessment = make_synapse_assessment()
+    database = assessment.sql_pools["serverless_pool"]["databases"]["databases"][0]
+    database["name"] = "db\nname"
+    schema = database["schemas"]["schemas"][0]
+    schema["name"] = "schema:name"
+    table = schema["tables"]["tables"][0]
+    table["name"] = "table?name"
+    schema["views"]["views"].append({"name": "view*name", "columns": []})
+
+    JSONExporter().export(
+        assessment,
+        str(tmp_path),
+        workspace_name,
+        output_adapter=OutputPathAdapter(str(tmp_path), is_windows=os.name == "nt"),
+        legacy_path_limit=os.name == "nt",
+    )
+
+    workspace_dir = tmp_path / safe_filename_component(workspace_name)
+    database_dir = (
+        workspace_dir / "data" / "serverless_databases" / "databases" / "db%0Aname"
+    )
+    schema_dir = database_dir / "schemas" / "schema%3Aname"
+    database_export = json.loads((database_dir / "db%0Aname.json").read_text())
+    table_export = json.loads((schema_dir / "tables" / "table%3Fname.json").read_text())
+    view_export = json.loads((schema_dir / "views" / "view%2Aname.json").read_text())
+
+    assert database_export["data"]["name"] == "db\nname"
+    assert table_export["data"]["name"] == "table?name"
+    assert view_export["data"]["name"] == "view*name"
 
 
 @pytest.mark.skipif(

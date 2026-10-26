@@ -213,6 +213,8 @@ Relative output paths are resolved to normalized absolute paths before the `\\?\
 
 Windows path handling details: [Maximum Path Length Limitation](https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation).
 
+Workspace and artifact names used in generated paths are encoded portably when needed. Filesystem-valid characters, including spaces and Unicode, are preserved; unsupported characters such as newlines, path separators, and Windows-reserved punctuation are percent-encoded (for example, a newline becomes `%0A`). Original names remain unchanged in JSON data and report content. Nested Databricks notebook source folders are preserved, with each path component encoded separately.
+
 **Examples:**
 ```bash
 # Assess Synapse workspaces (interactive selection)

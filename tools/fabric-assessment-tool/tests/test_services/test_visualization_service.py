@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from fabric_assessment_tool.services.visualization_service import VisualizationService
+from fabric_assessment_tool.utils.filenames import safe_filename_component
 
 
 @pytest.fixture
@@ -455,6 +456,43 @@ class TestVisualizationService:
         with open(ws_file, "r", encoding="utf-8") as f:
             html = f.read()
             assert "test-workspace" in html
+
+    def test_generate_report_encodes_workspace_filename_and_keeps_original_name(
+        self, visualization_service, tmp_path
+    ):
+        workspace_name = "workspace\nname:?"
+        input_dir = tmp_path / "assessment"
+        encoded_workspace = safe_filename_component(workspace_name)
+        workspace_dir = input_dir / encoded_workspace
+        workspace_dir.mkdir(parents=True)
+        (workspace_dir / "summary.json").write_text(
+            json.dumps(
+                {
+                    "workspace_info": {"name": workspace_name},
+                    "data_engineering": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        data = visualization_service._load_assessment_data(
+            input_dir, workspace=workspace_name
+        )
+        output_dir = tmp_path / "reports"
+        output_dir.mkdir()
+        visualization_service._generate_overview(data, output_dir, "synapse")
+        workspace_report_path = visualization_service._generate_workspace_report(
+            workspace_name, data, output_dir
+        )
+
+        workspace_report = output_dir / "workspaces" / f"{encoded_workspace}.html"
+        assert workspace_report.is_file()
+        assert Path(workspace_report_path) == workspace_report
+        index_html = (output_dir / "index.html").read_text(encoding="utf-8")
+        encoded_url_workspace = encoded_workspace.replace("%", "%25")
+        assert f"workspaces/{encoded_url_workspace}.html" in index_html
+        assert workspace_name in index_html
+        assert workspace_name in workspace_report.read_text(encoding="utf-8")
 
     def test_empty_input_directory(self, visualization_service, tmp_path):
         """Test handling of empty input directory."""

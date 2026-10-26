@@ -1,8 +1,10 @@
+import json
 import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from fabric_assessment_tool.clients.databricks_client import DatabricksClient
+from fabric_assessment_tool.utils.filenames import safe_filename_component
 
 workspace_name = "mcole-adb"
 
@@ -220,6 +222,31 @@ def test_aws_workspace_requires_environment_authentication():
         assert "DATABRICKS_TOKEN" in str(exc)
     else:
         raise AssertionError("Expected AWS Databricks auth validation to fail")
+
+
+def test_partial_resource_load_uses_encoded_workspace_directory(tmp_path):
+    workspace_name = "workspace\nname:?"
+    workspace_dir = tmp_path / safe_filename_component(workspace_name)
+    repos_dir = workspace_dir / "resources" / "repos"
+    repos_dir.mkdir(parents=True)
+    (repos_dir / "repo_test.json").write_text(
+        json.dumps(
+            {
+                "type": "databricks_cluster",
+                "repo_data": {"repo_id": "repo-id", "path": "/Repos/user/project"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    client = DatabricksClient.__new__(DatabricksClient)
+
+    loaded = client._load_resources_from_disk(
+        workspace_name,
+        str(tmp_path),
+        resources_to_extract=["jobs"],
+    )
+
+    assert len(loaded["repos"].repos) == 1
 
 
 @patch("fabric_assessment_tool.clients.databricks_client.AccountClient")

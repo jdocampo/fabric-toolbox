@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Windows Export Path Preflight**: Detect destination path capabilities, validate complete export paths before writing, and support `--windows-long-paths` with an interactive retry using collected assessment data.
+- **Safe Artifact Filenames**: Preserve valid artifact names and reversibly percent-encode unsupported characters in generated export and visualization paths.
 
 ## [0.3.0] - 2026-07-06
 

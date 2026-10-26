@@ -60,6 +60,7 @@ from ..assessment.databricks import (
     DatabricksWorkspaceInfo,
     DatabricksNetworkSettings,
 )
+from ..utils.filenames import safe_filename_component
 from ..utils.output_paths import OutputPathAdapter
 from ..utils import ui as utils_ui
 from .api_client import ApiClient, ApiResponse
@@ -672,7 +673,9 @@ class DatabricksClient:
             Dict mapping resource type name to its collection dataclass
         """
         adapter = output_adapter or OutputPathAdapter(output_path)
-        workspace_dir = adapter.root / workspace_name / "resources"
+        workspace_dir = (
+            adapter.root / safe_filename_component(workspace_name) / "resources"
+        )
         loaded: Dict[str, Any] = {}
 
         # Mapping from resource name to (folder name, item class, collection class, collection field)

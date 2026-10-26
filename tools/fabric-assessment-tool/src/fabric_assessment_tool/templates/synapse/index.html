@@ -127,7 +127,7 @@
                     {% set dw_serverless = dw_counts.get('serverless', {}) if dw_counts is mapping else {} %}
                     <tr data-workspace="{{ ws_name }}">
                         <td>
-                            <a href="{{ base_path }}workspaces/{{ ws_name }}.html">{{ ws_name }}</a>
+                            <a href="{{ base_path }}workspaces/{{ ws_name | filename_url_component }}.html">{{ ws_name }}</a>
                         </td>
                         <td class="text-right">
                             {{ de_hybrid.get('notebooks', de.get('notebooks', 0)) if de_hybrid is mapping else de.get('notebooks', 0) }}
